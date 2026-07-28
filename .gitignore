@@ -1,0 +1,9 @@
+# Datos internos de Godot
+.godot/
+
+# Builds exportadas
+build/
+export/
+
+# Temporales
+*.tmp

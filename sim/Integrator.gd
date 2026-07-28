@@ -1,0 +1,355 @@
+class_name Integrator
+extends RefCounted
+
+## El corazón de la arquitectura: avanza un nodo agregado `dt` ciclos **en forma cerrada**.
+##
+## No hay dos caminos "online" y "offline". Hay uno: `advance(node, params, dt, mult)`.
+## El tick del juego lo llama con `dt = 1` ciclo; el catch-up al volver de estar cerrado lo
+## llama con `dt = 40000`. El resultado es el mismo porque la solución analítica es
+## **componible**: avanzar 1+1+1 da lo mismo que avanzar 3 (salvo error de coma flotante).
+##
+## Cómo puede ser cerrado:
+##
+##   1. La población sigue una logística hacia el alojamiento `K` (o decae exponencialmente
+##      si hay hambruna). Ambas tienen solución exacta.
+##   2. La producción es **lineal en la población** (contrato de `BuildingDef`), así que
+##      `dR/dt = a·P(t) + b`, y `∫P dt` de una logística también tiene forma cerrada.
+##   3. Lo que rompe la linealidad son eventos discretos —un stock que toca su tope o llega
+##      a cero, un edificio que se queda sin puestos libres—. En vez de simular, se **resuelve
+##      el instante** en que ocurre el primer evento, se avanza exactamente hasta ahí, se
+##      recalcula el segmento y se sigue.
+##
+## Coste: O(nº de eventos), no O(nº de ciclos). Un asentamiento típico resuelve un día
+## offline en un puñado de segmentos.
+
+const EPS := 1.0e-9
+## Por encima de esto, `exp` desborda: las fórmulas están escritas para no llegar nunca.
+const SCAN_SAMPLES := 16
+
+
+## Multiplicadores externos que entran en el tramo. Son **constantes** dentro de un segmento
+## (bonos de legado, eficiencia de gobernador, penalización offline): por eso se pueden meter
+## en la solución analítica sin romperla. Cualquier bono que dependiera del tiempo o del
+## estado tendría que convertirse en un evento de segmento, no en un factor.
+class Modifiers:
+	extends RefCounted
+	var production: float = 1.0   ## toda la producción y el consumo de los edificios
+	var food: float = 1.0         ## extra solo sobre la producción de comida
+	var growth: float = 1.0       ## sobre la tasa de crecimiento de población
+	var housing: float = 1.0      ## sobre el techo de población
+
+	static func none() -> Modifiers:
+		return Modifiers.new()
+
+	func scaled(factor: float) -> Modifiers:
+		var m := Modifiers.new()
+		m.production = production * factor
+		m.food = food
+		m.growth = growth
+		m.housing = housing
+		return m
+
+
+## Un tramo de tiempo en el que la dinámica es lineal y tiene solución exacta.
+class Segment:
+	extends RefCounted
+	var housing: float = 0.0        ## techo de población (K de la logística)
+	var rate: float = 0.0           ## r > 0 logística hacia K, r < 0 decaimiento exponencial
+	var starving: bool = false      ## la comida es el límite Y sobra población
+	var food_limited: bool = false  ## la comida manda por encima del alojamiento
+	var slope := Goods.zeros()      ## a: parte de dR/dt proporcional a la población
+	var offset := Goods.zeros()     ## b: parte constante (edificios saturados)
+	var caps := Goods.zeros()
+	var pinned := PackedInt32Array()  ## 1 = el stock está fijado (a tope o a cero)
+	## Poblaciones a las que un centro de trabajo pasa de tener puestos libres a saturado.
+	var thresholds := PackedFloat64Array()
+
+	func _init() -> void:
+		pinned.resize(Goods.COUNT)
+
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+## Avanza el nodo `dt` ciclos. Devuelve el número de segmentos consumidos, útil para los
+## tests y para detectar dinámicas patológicas.
+static func advance(node: SimNode, params: SimParams, dt: float, mods: Modifiers = null) -> int:
+	if dt <= EPS:
+		return 0
+	if mods == null:
+		mods = Modifiers.none()
+	var remaining := dt
+	var segments := 0
+	while remaining > EPS and segments < params.max_segments:
+		segments += 1
+		var seg := build_segment(node, params, mods)
+		var step := _next_event_time(node, seg, remaining, params)
+		_apply(node, seg, step)
+		remaining -= step
+	if remaining > EPS:
+		# Salvaguarda: dinámica que genera eventos sin parar. Se avanza el resto de un tirón;
+		# es menos exacto, pero acotado y nunca cuelga el juego.
+		var seg := build_segment(node, params, mods)
+		_apply(node, seg, remaining)
+	return segments
+
+
+## Construye el tramo lineal válido a partir del estado actual del nodo.
+static func build_segment(node: SimNode, params: SimParams, mods: Modifiers) -> Segment:
+	var seg := Segment.new()
+	seg.housing = node.housing(params) * mods.housing
+	seg.caps = node.storage_caps(params)
+
+	var pop := maxf(node.pop, 0.0)
+	var shares := job_shares(node)
+
+	# a·P + b, separando los centros de trabajo con puestos libres (lineales en P) de los
+	# que ya están saturados (aportan una constante).
+	for bi in node.buildings.size():
+		var count := node.buildings[bi]
+		if count <= 0:
+			continue
+		var b := Content.building(bi)
+		if not b.is_workplace():
+			continue
+		var share := shares[bi]
+		if share <= 0.0:
+			continue
+		var capacity := b.worker_slots * float(count)
+		var wanted := share * pop
+		if wanted >= capacity - EPS:
+			# Saturado: aporta una constante y deja de depender de la población.
+			for i in Goods.COUNT:
+				seg.offset[i] += capacity * _net(b, i, mods)
+		else:
+			for i in Goods.COUNT:
+				seg.slope[i] += share * _net(b, i, mods)
+		# Población a la que este centro cambia de régimen (se satura, o se desatura si la
+		# población está cayendo). En ambos sentidos es una frontera de tramo.
+		seg.thresholds.append(capacity / share)
+
+	# Producción bruta de comida antes de descontar lo que come la gente: hace falta aparte
+	# para calcular a cuánta población da de comer este reparto de trabajo.
+	var food_slope := seg.slope[Goods.FOOD]
+	var food_offset := seg.offset[Goods.FOOD]
+
+	# El consumo de comida por habitante NO lo escalan los bonos: comer se come igual
+	# offline y con o sin legado. Solo la producción se multiplica.
+	seg.slope[Goods.FOOD] -= params.food_per_pop
+
+	# El techo de población es el menor de los dos límites reales: dónde meter a la gente
+	# y a cuánta gente da de comer el campo.
+	#
+	# Que la comida entre como **techo** y no como un modo de hambruna aparte es lo que
+	# mantiene la simulación estable: la población se acerca asintóticamente a lo que el
+	# campo sostiene y se queda ahí. Si la comida solo frenara al agotarse el almacén, el
+	# sistema entraría en un ciclo límite (crecer → hambruna → morir → crecer) que ni el
+	# integrador ni el jugador pueden leer, y que hace que un salto largo y muchos pasos
+	# cortos den resultados distintos.
+	seg.housing = minf(seg.housing, _food_capacity(food_slope, food_offset, params))
+	seg.food_limited = seg.housing < node.housing(params) * mods.housing - EPS
+
+	# Stocks fijados: los que están a tope subiendo, o a cero bajando.
+	for i in Goods.COUNT:
+		var rate := seg.slope[i] * pop + seg.offset[i]
+		if node.stocks[i] >= seg.caps[i] - EPS and rate >= 0.0:
+			seg.pinned[i] = 1
+		elif node.stocks[i] <= EPS and rate <= 0.0:
+			seg.pinned[i] = 1
+
+	# Tres regímenes, los tres con solución exacta:
+	#   K ≈ 0        → no hay nada que comer: decaimiento exponencial hacia cero.
+	#   pop > K      → sobra gente para lo que hay: logística descendente hacia K.
+	#   pop ≤ K      → crecimiento logístico normal hacia K.
+	if seg.housing <= EPS:
+		seg.rate = -params.starvation_rate
+	elif node.pop > seg.housing + EPS:
+		seg.rate = params.starvation_rate
+	else:
+		seg.rate = params.growth_rate * mods.growth
+	seg.starving = seg.food_limited and node.pop > seg.housing + EPS
+	return seg
+
+
+## A cuánta población da de comer este reparto de trabajo, resolviendo
+## `producción(P) = consumo(P)`. INF si la producción crece más rápido que las bocas.
+static func _food_capacity(slope: float, offset: float, params: SimParams) -> float:
+	var margin := params.food_per_pop - slope
+	if margin <= EPS:
+		return INF
+	return maxf(offset / margin, 0.0)
+
+
+## Producción neta de un recurso por trabajador, con los multiplicadores ya aplicados.
+static func _net(b: BuildingDef, good: int, mods: Modifiers) -> float:
+	var factor := mods.production
+	if good == Goods.FOOD:
+		factor *= mods.food
+	return (b.produces[good] - b.consumes[good]) * factor
+
+
+## Reparto normalizado de la mano de obra entre los centros de trabajo existentes.
+static func job_shares(node: SimNode) -> PackedFloat64Array:
+	var shares := PackedFloat64Array()
+	shares.resize(node.buildings.size())
+	var sum := 0.0
+	for bi in node.buildings.size():
+		if node.buildings[bi] <= 0:
+			continue
+		if not Content.building(bi).is_workplace():
+			continue
+		sum += maxf(node.jobs[bi], 0.0)
+	if sum <= 0.0:
+		return shares
+	for bi in node.buildings.size():
+		if node.buildings[bi] <= 0 or not Content.building(bi).is_workplace():
+			continue
+		shares[bi] = maxf(node.jobs[bi], 0.0) / sum
+	return shares
+
+
+# ---------------------------------------------------------------------------
+# Soluciones exactas de la población
+# ---------------------------------------------------------------------------
+
+## P(t). Escrita con `exp(-r·t)` para que no desborde por muy grande que sea `t`.
+static func pop_at(p0: float, k: float, r: float, t: float) -> float:
+	if p0 <= EPS:
+		return 0.0
+	if absf(r) <= EPS:
+		return p0
+	if r < 0.0:
+		return p0 * exp(r * t)
+	if k <= EPS:
+		return 0.0
+	var decay := exp(-r * t)
+	return k / (1.0 + ((k - p0) / p0) * decay)
+
+
+## ∫₀ᵗ P(s) ds — lo que permite integrar los stocks sin simular ciclos.
+static func pop_integral(p0: float, k: float, r: float, t: float) -> float:
+	if p0 <= EPS:
+		return 0.0
+	if absf(r) <= EPS:
+		return p0 * t
+	if r < 0.0:
+		return p0 * (1.0 - exp(r * t)) / -r
+	if k <= EPS:
+		return 0.0
+	# ∫ = (K/r)·[ r·t + ln((P0 + (K−P0)·e^{−rt}) / K) ], reordenada para no desbordar.
+	var decay := exp(-r * t)
+	return (k / r) * (r * t + log((p0 + (k - p0) * decay) / k))
+
+
+## Instante en que la población alcanza `target`, o INF si no lo alcanza.
+##
+## Sirve en los dos sentidos: la logística sube hacia K si `p0 < K` y baja hacia K si
+## `p0 > K`, y la misma inversión vale para ambos. Objetivos que la curva no alcanza
+## (o que ya dejó atrás) devuelven INF de forma natural al mirar el signo del cociente.
+static func time_to_pop(p0: float, k: float, r: float, target: float) -> float:
+	if p0 <= EPS or absf(r) <= EPS or target <= 0.0:
+		return INF
+	if r < 0.0:
+		if target >= p0:
+			return INF
+		return log(target / p0) / r
+	if k <= EPS or absf(target - k) <= EPS:
+		return INF  # K es asíntota: no se alcanza en tiempo finito
+	# t = −(1/r)·ln[ P0·(K−target) / (target·(K−P0)) ]
+	var num := p0 * (k - target)
+	var den := target * (k - p0)
+	if absf(den) <= EPS or num / den <= 0.0:
+		return INF
+	var t := -log(num / den) / r
+	return t if t > EPS else INF
+
+
+# ---------------------------------------------------------------------------
+# Eventos y aplicación
+# ---------------------------------------------------------------------------
+
+static func _next_event_time(node: SimNode, seg: Segment, max_t: float, params: SimParams) -> float:
+	var best := max_t
+
+	# 1. La población satura (o desatura) un centro de trabajo.
+	for target in seg.thresholds:
+		var t := time_to_pop(node.pop, seg.housing, seg.rate, target)
+		if t > EPS and t < best:
+			best = t
+
+	# 2. Un stock libre toca su tope o se agota.
+	#
+	# Hay que mirar los **dos** extremos, no solo el que sugiere el signo de la tasa ahora
+	# mismo: la tasa es `a·P + b` y P se mueve dentro del tramo, así que un stock que ahora
+	# sube puede darse la vuelta y agotarse antes de que acabe el segmento. Comprobar solo
+	# el extremo "hacia el que va" fue exactamente el fallo que hacía que un salto largo
+	# se saltase la hambruna que sí veía el paso a paso.
+	for i in Goods.COUNT:
+		if seg.pinned[i] == 1:
+			continue
+		for target in [0.0, seg.caps[i]]:
+			if target == INF:
+				continue
+			var t := _time_to_stock(node, seg, i, target, best, params)
+			if t > EPS and t < best:
+				best = t
+
+	# 3. Un stock fijado se libera porque su tasa cambia de signo al moverse la población.
+	for i in Goods.COUNT:
+		if seg.pinned[i] == 0:
+			continue
+		if absf(seg.slope[i]) <= EPS:
+			continue
+		var flip := -seg.offset[i] / seg.slope[i]
+		var t := time_to_pop(node.pop, seg.housing, seg.rate, flip)
+		if t > EPS and t < best:
+			best = t
+
+	return best
+
+
+## Resuelve `R_i(t) = target` por barrido grueso + bisección. La forma cerrada hace que esto
+## cueste lo mismo tanto si el tramo dura 1 ciclo como si dura 40.000.
+static func _time_to_stock(
+	node: SimNode, seg: Segment, good: int, target: float, max_t: float, params: SimParams
+) -> float:
+	var start := node.stocks[good] - target
+	var lo := 0.0
+	var lo_val := start
+	var hi := -1.0
+	for s in range(1, SCAN_SAMPLES + 1):
+		var t := max_t * float(s) / float(SCAN_SAMPLES)
+		var val := _stock_at(node, seg, good, t) - target
+		if signf(val) != signf(lo_val) or absf(val) <= EPS:
+			hi = t
+			break
+		lo = t
+		lo_val = val
+	if hi < 0.0:
+		return INF
+	for _i in params.solver_iterations:
+		var mid := (lo + hi) * 0.5
+		var val := _stock_at(node, seg, good, mid) - target
+		if signf(val) == signf(lo_val):
+			lo = mid
+			lo_val = val
+		else:
+			hi = mid
+	return hi
+
+
+static func _stock_at(node: SimNode, seg: Segment, good: int, t: float) -> float:
+	var integral := pop_integral(node.pop, seg.housing, seg.rate, t)
+	return node.stocks[good] + seg.slope[good] * integral + seg.offset[good] * t
+
+
+static func _apply(node: SimNode, seg: Segment, t: float) -> void:
+	var integral := pop_integral(node.pop, seg.housing, seg.rate, t)
+	for i in Goods.COUNT:
+		if seg.pinned[i] == 1:
+			continue
+		var value := node.stocks[i] + seg.slope[i] * integral + seg.offset[i] * t
+		node.stocks[i] = clampf(value, 0.0, seg.caps[i])
+	node.pop = pop_at(node.pop, seg.housing, seg.rate, t)
+	node.starving = seg.starving
