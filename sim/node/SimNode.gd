@@ -27,7 +27,11 @@ var pop: float = 0.0
 var stocks: PackedFloat64Array = Goods.zeros()
 ## Ejemplares construidos, indexados por el índice global de `Content.buildings()`.
 var buildings: PackedInt32Array = PackedInt32Array()
-## Pesos de reparto de mano de obra, mismo índice que `buildings`. Se normalizan al usarse.
+## **Trabajadores destinados** a cada oficio, mismo índice que `buildings`.
+##
+## Es un número de personas, no un peso: si aquí pone 6, hay seis granjeros. Lo que no está
+## asignado está ocioso. El motor no reparte a nadie por su cuenta — construir una granja no
+## la llena de gente, la llenas tú.
 var jobs: PackedFloat64Array = PackedFloat64Array()
 
 ## Está en déficit de comida (la población decrece). Lo fija el integrador.

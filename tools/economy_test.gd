@@ -13,6 +13,7 @@ const TestUtil := preload("res://tools/TestUtil.gd")
 func _init() -> void:
 	var failures := 0
 	failures += _starting_margin()
+	failures += _nothing_happens_by_itself()
 	failures += _managed_survives()
 	failures += _mismanaged_starves()
 	failures += _promotion_reachable()
@@ -20,34 +21,110 @@ func _init() -> void:
 	TestUtil.finish(self, failures)
 
 
-## El reparto de partida tiene que sostenerse **incluso con el peaje de delegación**.
+## El techo alimentario tiene que ser un **número legible**, no un acantilado.
 ##
-## Hay un acantilado inherente al modelo: mientras una granja tiene puestos libres, su
-## producción es proporcional a la población igual que el consumo, así que si la producción
-## por trabajador queda por debajo del consumo por habitante, **ninguna población es
-## sostenible** y el techo alimentario es 0, no un número pequeño. Con los valores actuales
-## el margen del reparto inicial bajo un gobernador es de apenas el 2 %: cualquier retoque a
-## la baja en la granja, o a la baja en `governor_efficiency`, extingue asentamientos recién
-## fundados. Este test es el que avisa.
+## Con el reparto de oficios por pesos había un acantilado inherente: mientras una granja
+## tenía puestos libres, su producción crecía con la población igual que el consumo, así que
+## por debajo de cierto reparto **ninguna población era sostenible** y el techo era 0 en vez
+## de un número pequeño. Un retoque mínimo en la granja extinguía asentamientos enteros.
+##
+## Con trabajadores asignados a mano eso desaparece en el régimen normal: la producción es una
+## constante (seis granjeros producen lo que producen seis granjeros), así que el techo es
+## siempre `producción / consumo por habitante` — finito, positivo y explicable en la UI.
 func _starting_margin() -> int:
 	var engine := TestUtil.make_engine(1)
 	var node := engine.state.root()
-	var mods := Integrator.Modifiers.none().scaled(engine.params.governor_efficiency)
-	var seg := Integrator.build_segment(node, engine.params, mods)
+	var snap := Integrator.snapshot(node, engine.params)
 
-	var shares := Integrator.job_shares(node)
 	var farm := Content.building_index("farm")
-	var per_worker := shares[farm] * Content.building(farm).produces[Goods.FOOD] \
-		* engine.params.governor_efficiency
-	var margin := per_worker / engine.params.food_per_pop - 1.0
+	var expected := node.jobs[farm] * Content.building(farm).produces[Goods.FOOD] \
+		/ engine.params.food_per_pop
 
-	return TestUtil.check(
-		seg.housing > 0.0,
-		"el reparto inicial se sostiene delegado: margen alimentario %+.1f %%" % (margin * 100.0),
-		"el reparto inicial NO se sostiene delegado (techo %0.2f, margen %+.1f %%): un " % [
-			seg.housing, margin * 100.0,
-		] + "asentamiento recién fundado y delegado se extingue solo"
+	var failures := TestUtil.check(
+		snap.food_capacity > 0.0 and snap.food_capacity != INF,
+		"techo alimentario legible: %.1f habitantes con %.0f granjeros" % [
+			snap.food_capacity, node.jobs[farm],
+		],
+		"el techo alimentario no es un número usable: %.2f" % snap.food_capacity
 	)
+	failures += TestUtil.check(
+		TestUtil.rel_error(snap.food_capacity, expected) < 0.001,
+		"y sale exactamente de la cuenta: producción ÷ consumo = %.1f" % expected,
+		"el techo (%.2f) no cuadra con producción ÷ consumo (%.2f)" % [
+			snap.food_capacity, expected,
+		]
+	)
+
+	# Y con el peaje de delegación sigue siendo sostenible, no cae a cero.
+	var delegated := Integrator.snapshot(node, engine.params,
+		Integrator.Modifiers.none().scaled(engine.params.governor_efficiency))
+	failures += TestUtil.check(
+		delegated.food_capacity > engine.params.initial_pop,
+		"delegado sigue dando de comer a %.1f (población inicial %.0f)" % [
+			delegated.food_capacity, engine.params.initial_pop,
+		],
+		"delegado el techo cae a %.1f, por debajo de la población inicial" % \
+			delegated.food_capacity
+	)
+	return failures
+
+
+## **Sin delegar, el juego no toca nada por su cuenta.** Ni destina trabajadores al construir,
+## ni compra edificios. La gestión es del jugador hasta que la cede.
+func _nothing_happens_by_itself() -> int:
+	var engine := TestUtil.make_engine(4242)
+	var node := engine.state.root()
+	var farm := Content.building_index("farm")
+
+	# Construir una granja no pone a nadie dentro.
+	node.stocks[Goods.WOOD] = 5000.0
+	var before := node.jobs[farm]
+	Construction.build(node, farm, 0.0, null)
+	var failures := TestUtil.check(
+		node.jobs[farm] == before,
+		"construir no destina a nadie: la granja nueva nace vacía (%.0f granjeros)" % before,
+		"construir ha destinado gente solo: %.0f → %.0f" % [before, node.jobs[farm]]
+	)
+
+	# Y 3.000 ciclos después no se ha comprado nada ni se ha movido un trabajador.
+	var buildings_before := node.building_total()
+	var jobs_before := node.jobs.duplicate()
+	for _i in 120:
+		engine.tick(25.0)
+	failures += TestUtil.check(
+		node.building_total() == buildings_before,
+		"3.000 ciclos sin delegar: sigue habiendo %d edificios, no se compra nada solo" % \
+			buildings_before,
+		"se han comprado %d edificios sin permiso" % (node.building_total() - buildings_before)
+	)
+	failures += TestUtil.check(
+		node.jobs == jobs_before,
+		"y el reparto de oficios no lo ha tocado nadie",
+		"el reparto de oficios ha cambiado solo"
+	)
+
+	# Los topes: no se puede mandar a más gente de la que hay ni de la que cabe.
+	Construction.set_workers(node, farm, 9999.0)
+	var capacity := Construction.capacity_of(node, farm)
+	failures += TestUtil.check(
+		node.jobs[farm] <= minf(capacity, node.pop) + 0.001,
+		"topes respetados: pedir 9.999 granjeros deja %.0f (puestos %.0f, población %.1f)" % [
+			node.jobs[farm], capacity, node.pop,
+		],
+		"se han destinado %.0f granjeros con %.0f puestos y %.1f habitantes" % [
+			node.jobs[farm], capacity, node.pop,
+		]
+	)
+
+	var woodcutter := Content.building_index("woodcutter")
+	Construction.set_workers(node, woodcutter, 9999.0)
+	var total := node.jobs[farm] + node.jobs[woodcutter]
+	failures += TestUtil.check(
+		total <= node.pop + 0.001,
+		"nadie trabaja en dos sitios: %.0f destinados de %.1f habitantes" % [total, node.pop],
+		"hay %.0f trabajadores destinados con solo %.1f habitantes" % [total, node.pop]
+	)
+	return failures
 
 
 ## Un asentamiento delegado en un gobernador equilibrado tiene que prosperar 5.000 ciclos.
@@ -78,8 +155,8 @@ func _managed_survives() -> int:
 func _mismanaged_starves() -> int:
 	var engine := TestUtil.make_engine(2024)
 	var root := engine.state.root()
-	root.jobs[Content.building_index("farm")] = 0.0
-	root.jobs[Content.building_index("woodcutter")] = 1.0
+	Construction.set_workers(root, Content.building_index("farm"), 0.0)
+	Construction.set_workers(root, Content.building_index("woodcutter"), root.pop)
 	var start_pop := root.pop
 	var flagged := false
 

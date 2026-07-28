@@ -8,7 +8,8 @@ extends RefCounted
 ## **solo leen**. Un único RNG sembrado vive dentro, así que el mundo es reproducible:
 ## mismo seed + misma secuencia de acciones ⇒ mismo `state_hash()`.
 
-const SCHEMA_VERSION := 1
+## 2 — `jobs` pasó de pesos relativos a número de trabajadores destinados.
+const SCHEMA_VERSION := 2
 
 var world_seed: int = 0
 var nodes: Dictionary = {}       ## id:int -> SimNode
@@ -40,11 +41,12 @@ static func create(seed_value: int, params: SimParams) -> WorldState:
 	root.pop = params.initial_pop
 	root.stocks[Goods.FOOD] = 50.0
 	root.stocks[Goods.WOOD] = 40.0
-	# Reparto de partida: la mitad al campo, la mitad al bosque.
-	root.jobs[Content.building_index("farm")] = 1.0
-	root.jobs[Content.building_index("woodcutter")] = 1.0
 	root.buildings[Content.building_index("farm")] = 1
 	root.buildings[Content.building_index("woodcutter")] = 1
+	# Reparto **de partida**, no automático: los cinco fundadores llegan con su oficio puesto
+	# (tres al campo, dos al bosque). A partir de aquí no se destina a nadie sin que lo mandes.
+	root.jobs[Content.building_index("farm")] = 3.0
+	root.jobs[Content.building_index("woodcutter")] = 2.0
 	state.refresh_totals()
 	return state
 

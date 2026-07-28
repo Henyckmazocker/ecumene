@@ -15,7 +15,9 @@ extends CanvasLayer
 
 signal build_requested(building_index: int)
 signal speed_requested(index: int)
-signal job_changed(building_index: int, weight: float)
+## Mover gente a un oficio (`amount` negativo la saca).
+signal workers_changed(building_index: int, amount: float)
+signal delegation_toggled(delegated: bool)
 
 const IDLE_COLOR := Color(0.62, 0.62, 0.60)
 const WARN_COLOR := Color(0.85, 0.35, 0.30)
@@ -29,8 +31,13 @@ var _resource_box: VBoxContainer
 var _build_box: HBoxContainer
 var _build_buttons: Dictionary = {}
 var _job_box: VBoxContainer
-var _job_sliders: Dictionary = {}
+var _job_rows: Dictionary = {}
+var _idle_label: Label
+var _step_buttons: Array[Button] = []
+var _delegate_button: Button
 var _speed_buttons: Array[Button] = []
+## Cuánta gente mueve cada pulsación. Con miles de habitantes, ir de uno en uno es inviable.
+var _step: int = 1
 var _feed: Label
 var _feed_lines: PackedStringArray = PackedStringArray()
 
@@ -101,10 +108,15 @@ func _build_bottom() -> Control:
 	row.add_theme_constant_override("separation", 24)
 	box.add_child(row)
 
+	var jobs_column := VBoxContainer.new()
+	jobs_column.add_theme_constant_override("separation", 4)
+	jobs_column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(jobs_column)
+	jobs_column.add_child(_build_jobs_header())
+
 	_job_box = VBoxContainer.new()
 	_job_box.add_theme_constant_override("separation", 2)
-	_job_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(_job_box)
+	jobs_column.add_child(_job_box)
 
 	var speeds := HBoxContainer.new()
 	speeds.add_theme_constant_override("separation", 6)
@@ -123,6 +135,44 @@ func _build_bottom() -> Control:
 	_build_box.add_theme_constant_override("separation", 6)
 	box.add_child(_build_box)
 	return panel
+
+
+## Cabecera del reparto: cuánta gente está sin destinar, con qué paso se mueve, y quién manda.
+func _build_jobs_header() -> Control:
+	var header := HBoxContainer.new()
+	header.add_theme_constant_override("separation", 14)
+
+	_idle_label = Label.new()
+	_idle_label.add_theme_font_size_override("font_size", 14)
+	_idle_label.custom_minimum_size = Vector2(150, 0)
+	header.add_child(_idle_label)
+
+	var step_label := Label.new()
+	step_label.text = "paso"
+	step_label.add_theme_font_size_override("font_size", 12)
+	step_label.modulate = Color(1, 1, 1, 0.6)
+	header.add_child(step_label)
+
+	for amount in [1, 10, 100]:
+		var button := Button.new()
+		button.text = str(amount)
+		button.custom_minimum_size = Vector2(46, 32)
+		button.pressed.connect(_on_step.bind(amount))
+		header.add_child(button)
+		_step_buttons.append(button)
+
+	_delegate_button = Button.new()
+	_delegate_button.custom_minimum_size = Vector2(0, 32)
+	_delegate_button.toggle_mode = true
+	_delegate_button.toggled.connect(func(on: bool) -> void: delegation_toggled.emit(on))
+	header.add_child(_delegate_button)
+	return header
+
+
+func _on_step(amount: int) -> void:
+	_step = amount
+	for i in _step_buttons.size():
+		_step_buttons[i].disabled = _step_buttons[i].text == str(amount)
 
 
 func _panel() -> PanelContainer:
@@ -171,6 +221,9 @@ func refresh(node: SimNode, state: WorldState, params: SimParams, snap: Integrat
 	_refresh_builds(node)
 	for i in _speed_buttons.size():
 		_speed_buttons[i].disabled = i == speed_index
+	if _step_buttons.size() == 3 and not _step_buttons[0].disabled \
+			and not _step_buttons[1].disabled and not _step_buttons[2].disabled:
+		_on_step(_step)  # marcar el paso activo la primera vez
 
 
 func _refresh_resources(node: SimNode, params: SimParams, snap: Integrator.Snapshot) -> void:
@@ -197,27 +250,47 @@ func _refresh_resources(node: SimNode, params: SimParams, snap: Integrator.Snaps
 		row.modulate = Color.WHITE if rate >= 0.0 else WARN_COLOR
 
 
-## Un deslizador por oficio. Es la decisión más frecuente del juego, así que vive en pantalla
-## y no detrás de un menú.
+## Una fila por oficio con **botones de más y menos**. Es la decisión más frecuente del juego,
+## así que vive en pantalla y no detrás de un menú.
+##
+## Antes era un deslizador de peso relativo, y era el control equivocado: un deslizador dice
+## «más o menos por aquí» cuando lo que hay que decir es «seis personas a la granja». Con
+## botones el número es exacto, se ve cuánta gente cabe, y queda claro que a nadie lo destinan
+## por ti.
 func _refresh_jobs(node: SimNode) -> void:
+	var workers := Integrator.effective_workers(node)
+	var idle := Integrator.idle_population(node)
+
+	_idle_label.text = "👤 %.0f sin destinar" % idle
+	_idle_label.modulate = IDLE_COLOR if idle < 1.0 else Color.WHITE
+
+	if _delegate_button != null:
+		var delegated := node.is_delegated()
+		_delegate_button.set_pressed_no_signal(delegated)
+		_delegate_button.text = "🎖️ Gobernador" if delegated else "🖐️ A mano"
+		_delegate_button.tooltip_text = "Un gobernador reparte y construye por ti, al %d %% de rendimiento." % 85
+
 	for bi in node.buildings.size():
 		var is_job := node.buildings[bi] > 0 and Content.building(bi).is_workplace()
-		if not _job_sliders.has(bi):
+		if not _job_rows.has(bi):
 			if not is_job:
 				continue
-			_job_sliders[bi] = _make_job_row(bi)
-		var row: HBoxContainer = _job_sliders[bi]
+			_job_rows[bi] = _make_job_row(bi)
+		var row: HBoxContainer = _job_rows[bi]
 		row.visible = is_job
 		if not is_job:
 			continue
-		var slider: HSlider = row.get_child(1)
-		if not slider.has_focus():
-			slider.set_value_no_signal(node.jobs[bi])
-		var workers := Integrator.effective_workers(node)[bi]
-		var capacity := Content.building(bi).worker_slots * float(node.buildings[bi])
-		var count: Label = row.get_child(2)
-		count.text = "%.1f/%.0f" % [workers, capacity]
-		count.modulate = OK_COLOR if workers >= capacity - 0.05 else Color.WHITE
+
+		var capacity := Construction.capacity_of(node, bi)
+		var count: Label = row.get_node("count")
+		count.text = "%.0f / %.0f" % [workers[bi], capacity]
+		count.modulate = OK_COLOR if workers[bi] >= capacity - 0.05 else Color.WHITE
+
+		# Deshabilitar cuando la acción no haría nada: se ve de un vistazo si el tope es de
+		# puestos construidos o de gente disponible.
+		(row.get_node("minus") as Button).disabled = node.jobs[bi] <= 0.0 or node.is_delegated()
+		(row.get_node("plus") as Button).disabled = node.is_delegated() \
+			or node.jobs[bi] >= capacity - 0.001 or idle < 1.0
 
 
 func _make_job_row(building_index: int) -> HBoxContainer:
@@ -231,21 +304,30 @@ func _make_job_row(building_index: int) -> HBoxContainer:
 	label.add_theme_font_size_override("font_size", 13)
 	row.add_child(label)
 
-	var slider := HSlider.new()
-	slider.min_value = 0.0
-	slider.max_value = 3.0
-	slider.step = 0.1
-	slider.custom_minimum_size = Vector2(180, 44)
-	slider.value_changed.connect(func(v: float) -> void: job_changed.emit(building_index, v))
-	row.add_child(slider)
+	row.add_child(_worker_button("minus", "−", building_index, -1.0))
 
 	var count := Label.new()
-	count.custom_minimum_size = Vector2(70, 0)
+	count.name = "count"
+	count.custom_minimum_size = Vector2(76, 0)
+	count.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	count.add_theme_font_size_override("font_size", 13)
 	row.add_child(count)
 
+	row.add_child(_worker_button("plus", "+", building_index, 1.0))
+
 	_job_box.add_child(row)
 	return row
+
+
+func _worker_button(node_name: String, text: String, building_index: int,
+		direction: float) -> Button:
+	var button := Button.new()
+	button.name = node_name
+	button.text = text
+	button.custom_minimum_size = Vector2(44, 40)  # mínimo táctil de la guía de UX
+	button.pressed.connect(func() -> void:
+		workers_changed.emit(building_index, direction * float(_step)))
+	return button
 
 
 func _refresh_builds(node: SimNode) -> void:
@@ -261,7 +343,9 @@ func _refresh_builds(node: SimNode) -> void:
 		b.text = "%s %s ×%d\n%s" % [
 			def.icon, def.name, node.buildings[bi], _cost_text(node, bi),
 		]
-		b.disabled = not Construction.can_build(node, bi)
+		# Delegado, construye el gobernador: los botones se apagan para que quede claro que
+		# ya no mandas tú, en vez de que parezca que el juego compra a tus espaldas.
+		b.disabled = node.is_delegated() or not Construction.can_build(node, bi)
 
 
 static func _cost_text(node: SimNode, building_index: int) -> String:

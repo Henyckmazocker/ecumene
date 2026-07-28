@@ -99,10 +99,31 @@ static func migrate(data: Dictionary) -> Dictionary:
 		return {}
 	while version < WorldState.SCHEMA_VERSION:
 		match version:
+			1:
+				_migrate_1_to_2(data)
+				version = 2
 			_:
 				push_warning("Ecumene: sin migración desde el esquema %d." % version)
 				return {}
+	data["schema"] = version
 	return data
+
+
+## v1 → v2: `jobs` dejó de ser un peso relativo y pasó a ser el número de trabajadores
+## destinados a cada oficio. Se convierte repartiendo la población de cada nodo según los
+## pesos viejos, que es exactamente lo que el motor hacía al vuelo antes de guardar.
+static func _migrate_1_to_2(data: Dictionary) -> void:
+	for node_data in data.get("nodes", []):
+		var jobs: Array = node_data.get("jobs", [])
+		var pop := float(node_data.get("pop", 0.0))
+		var total := 0.0
+		for weight in jobs:
+			total += maxf(float(weight), 0.0)
+		if total <= 0.0:
+			continue
+		for i in jobs.size():
+			jobs[i] = floor(maxf(float(jobs[i]), 0.0) / total * pop)
+		node_data["jobs"] = jobs
 
 
 static func erase() -> void:

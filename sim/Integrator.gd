@@ -104,32 +104,35 @@ static func build_segment(node: SimNode, params: SimParams, mods: Modifiers) -> 
 	seg.caps = node.storage_caps(params)
 
 	var pop := maxf(node.pop, 0.0)
-	var shares := job_shares(node)
+	var wanted := requested_workers(node)
+	var wanted_total := 0.0
+	for w in wanted:
+		wanted_total += w
 
-	# a·P + b, separando los centros de trabajo con puestos libres (lineales en P) de los
-	# que ya están saturados (aportan una constante).
+	# a·P + b. Con el reparto manual de oficios hay dos regímenes, y ninguno rompe la
+	# linealidad de la que depende la forma cerrada:
+	#
+	#   - Hay gente de sobra: cada puesto pedido se cubre y la producción es una **constante**
+	#     (todo va a `offset`, con pendiente cero). Que sobre población no produce más.
+	#   - No llega la gente: se reparte en proporción a lo pedido, y la producción vuelve a
+	#     ser **proporcional a la población** (todo va a `slope`).
+	var short_handed := wanted_total > pop + EPS and wanted_total > EPS
 	for bi in node.buildings.size():
-		var count := node.buildings[bi]
-		if count <= 0:
+		if wanted[bi] <= 0.0:
 			continue
 		var b := Content.building(bi)
-		if not b.is_workplace():
-			continue
-		var share := shares[bi]
-		if share <= 0.0:
-			continue
-		var capacity := b.worker_slots * float(count)
-		var wanted := share * pop
-		if wanted >= capacity - EPS:
-			# Saturado: aporta una constante y deja de depender de la población.
-			for i in Goods.COUNT:
-				seg.offset[i] += capacity * _net(b, i, mods)
-		else:
+		if short_handed:
+			var share := wanted[bi] / wanted_total
 			for i in Goods.COUNT:
 				seg.slope[i] += share * _net(b, i, mods)
-		# Población a la que este centro cambia de régimen (se satura, o se desatura si la
-		# población está cayendo). En ambos sentidos es una frontera de tramo.
-		seg.thresholds.append(capacity / share)
+		else:
+			for i in Goods.COUNT:
+				seg.offset[i] += wanted[bi] * _net(b, i, mods)
+
+	# La población a la que se cruza entre los dos regímenes es una frontera de tramo: por
+	# debajo del total asignado, los puestos dejan de cubrirse.
+	if wanted_total > EPS:
+		seg.thresholds.append(wanted_total)
 
 	# Producción bruta de comida antes de descontar lo que come la gente: hace falta aparte
 	# para calcular a cuánta población da de comer este reparto de trabajo.
@@ -224,43 +227,57 @@ static func snapshot(node: SimNode, params: SimParams, mods: Modifiers = null) -
 	return snap
 
 
-## Trabajadores efectivos por edificio: lo que el agregado usa de verdad, ya recortado por
-## los puestos disponibles. Es la cifra que los agentes visibles tienen que repartirse para
-## que lo que se ve en pantalla cuadre con lo que dicta el modelo.
-static func effective_workers(node: SimNode) -> PackedFloat64Array:
+## Puestos que el jugador ha pedido cubrir en cada edificio, ya recortados por los puestos que
+## realmente existen. Pedir 20 granjeros con 2 granjas construidas da 6, no 20.
+static func requested_workers(node: SimNode) -> PackedFloat64Array:
 	var out := PackedFloat64Array()
 	out.resize(node.buildings.size())
-	var shares := job_shares(node)
-	var pop := maxf(node.pop, 0.0)
 	for bi in node.buildings.size():
 		var count := node.buildings[bi]
-		if count <= 0 or shares[bi] <= 0.0:
+		if count <= 0:
 			continue
 		var b := Content.building(bi)
 		if not b.is_workplace():
 			continue
-		out[bi] = minf(shares[bi] * pop, b.worker_slots * float(count))
+		out[bi] = clampf(node.jobs[bi], 0.0, b.worker_slots * float(count))
 	return out
 
 
-## Reparto normalizado de la mano de obra entre los centros de trabajo existentes.
-static func job_shares(node: SimNode) -> PackedFloat64Array:
-	var shares := PackedFloat64Array()
-	shares.resize(node.buildings.size())
-	var sum := 0.0
-	for bi in node.buildings.size():
-		if node.buildings[bi] <= 0:
-			continue
-		if not Content.building(bi).is_workplace():
-			continue
-		sum += maxf(node.jobs[bi], 0.0)
-	if sum <= 0.0:
-		return shares
-	for bi in node.buildings.size():
-		if node.buildings[bi] <= 0 or not Content.building(bi).is_workplace():
-			continue
-		shares[bi] = maxf(node.jobs[bi], 0.0) / sum
-	return shares
+## Trabajadores efectivos por edificio: lo que el agregado usa de verdad.
+##
+## `node.jobs[b]` es el número de personas que **el jugador ha destinado** a ese oficio, no un
+## peso relativo. Esa es la diferencia con el modelo anterior, donde el motor normalizaba los
+## pesos y repartía toda la población automáticamente: aquí quien no está asignado a nada
+## está ocioso, y quedarse sin granjeros por descuido es una decisión del jugador.
+##
+## Dos regímenes, los dos lineales en la población (que es lo que el integrador necesita):
+##
+##   - **Normal** (`asignados ≤ población`): cada oficio recibe justo lo pedido. La producción
+##     es una **constante**, independiente de cuánta gente haya de más.
+##   - **Sobreasignado** (la población ha caído por debajo de lo asignado): se reparte lo que
+##     hay en proporción a lo pedido. La producción vuelve a ser proporcional a la población.
+static func effective_workers(node: SimNode) -> PackedFloat64Array:
+	var wanted := requested_workers(node)
+	var total := 0.0
+	for w in wanted:
+		total += w
+	var pop := maxf(node.pop, 0.0)
+	if total <= pop or total <= EPS:
+		return wanted
+	var factor := pop / total
+	for i in wanted.size():
+		wanted[i] *= factor
+	return wanted
+
+
+## Personas sin oficio asignado. En pantalla se ven deambulando, y es información de juego:
+## significa que tienes brazos de sobra para los puestos que has construido.
+static func idle_population(node: SimNode) -> float:
+	var wanted := effective_workers(node)
+	var working := 0.0
+	for w in wanted:
+		working += w
+	return maxf(node.pop - working, 0.0)
 
 
 # ---------------------------------------------------------------------------

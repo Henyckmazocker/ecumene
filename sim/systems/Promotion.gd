@@ -71,8 +71,10 @@ static func found_child(
 	child.stocks[Goods.FOOD] = _settler_food(params)
 	child.buildings[Content.building_index("farm")] = 1
 	child.buildings[Content.building_index("woodcutter")] = 1
-	child.jobs[Content.building_index("farm")] = 1.0
-	child.jobs[Content.building_index("woodcutter")] = 1.0
+	# Los colonos llegan con su oficio puesto, como los fundadores de la partida. A partir de
+	# ahí el reparto de la colonia es cosa de quien la lleve.
+	child.jobs[Content.building_index("farm")] = ceil(settlers * 0.6)
+	child.jobs[Content.building_index("woodcutter")] = floor(settlers * 0.4)
 	if events != null:
 		events.push("found", state.cycle, child.id,
 			"%s funda %s" % [node.name, child.name],

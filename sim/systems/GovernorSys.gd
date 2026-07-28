@@ -53,24 +53,46 @@ static func _decide(
 
 ## Reparte la mano de obra según las prioridades. La comida manda: si es ella la que pone el
 ## techo, su peso sube pase lo que pase en la política.
+##
+## Reparte **personas**, no pesos: desde que el reparto de oficios es explícito, el gobernador
+## tiene que hacer exactamente el mismo trabajo que haría el jugador con los botones, y por
+## las mismas funciones (`Construction.set_workers`).
 static func _rebalance_jobs(
 	node: SimNode, w: PackedFloat64Array, snap: Integrator.Snapshot
 ) -> void:
-	var food_weight := w[P_FOOD]
-	if snap.food_limited:
-		food_weight = maxf(food_weight, 0.7)
+	var priority := {}
+	var total_weight := 0.0
 	for bi in node.buildings.size():
 		if node.buildings[bi] <= 0:
 			continue
 		var b := Content.building(bi)
 		if not b.is_workplace():
 			continue
+		var weight := w[P_INDUSTRY]
 		if b.produces[Goods.FOOD] > 0.0:
-			node.jobs[bi] = food_weight
+			weight = maxf(w[P_FOOD], 0.7) if snap.food_limited else w[P_FOOD]
 		elif b.produces[Goods.WOOD] > 0.0:
-			node.jobs[bi] = w[P_GROWTH]
-		else:
-			node.jobs[bi] = w[P_INDUSTRY]
+			weight = w[P_GROWTH]
+		priority[bi] = weight
+		total_weight += weight
+	if total_weight <= 0.0:
+		return
+
+	# Vaciar antes de repartir: si no, `set_workers` recorta contra las asignaciones viejas y
+	# el reparto se queda pegado al del ciclo anterior.
+	for bi in priority:
+		Construction.set_workers(node, bi, 0.0)
+	for bi in priority:
+		var share: float = priority[bi] / total_weight
+		Construction.set_workers(node, bi, floor(node.pop * share))
+
+	# Lo que sobre, a quien todavía tenga puestos libres, por orden de prioridad.
+	var order := priority.keys()
+	order.sort_custom(func(a, b): return priority[a] > priority[b])
+	for bi in order:
+		if Integrator.idle_population(node) <= 0.0:
+			break
+		Construction.add_workers(node, bi, Integrator.idle_population(node))
 
 
 ## Construye el edificio más alineado con las prioridades que se pueda pagar.

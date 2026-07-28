@@ -126,9 +126,9 @@ func _converges_to_the_aggregate() -> int:
 	var v := make_village(2468, 1200)
 	v.live(20.0)
 
-	# Un vuelco brusco: todo el mundo al bosque.
-	Construction.set_job_weight(v.node, Content.building_index("farm"), 0.2)
-	Construction.set_job_weight(v.node, Content.building_index("woodcutter"), 3.0)
+	# Un vuelco brusco: se vacían las granjas y se manda a todo el mundo al bosque.
+	Construction.set_workers(v.node, Content.building_index("farm"), 2.0)
+	Construction.set_workers(v.node, Content.building_index("woodcutter"), v.node.pop)
 	v.engine.tick(1.0)
 	v.live(20.0)
 

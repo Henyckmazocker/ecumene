@@ -24,25 +24,31 @@ Antes de tocar diseño o balance, lee esa página y `Ecumene/Programación.md`.
    se teletransporta, nunca se rehace la multitud entera). Tuning en `CrowdParams`, jamás en
    `SimParams`. La excepción son **los edificios**: aparecen en el acto.
 
-3. **Un solo camino para avanzar el tiempo.** `Integrator.advance(node, params, dt, mods)` lo
+3. **Nada automático sin delegar.** `node.jobs[b]` son **personas destinadas**, no pesos:
+   construir una granja no la llena de gente y no se compra nada solo. Un juego de gestión que
+   se administra solo no tiene nada que administrar. La única excepción es un nodo delegado a
+   propósito, y entonces la UI apaga los botones. Ruta única para repartir:
+   `Construction.set_workers`, la misma para el jugador y para el gobernador.
+
+4. **Un solo camino para avanzar el tiempo.** `Integrator.advance(node, params, dt, mods)` lo
    usan igual el tick del juego (`dt = 1`) y el catch-up offline (`dt = 40000`). No se escribe
    una segunda ruta "para offline": si hace falta una, es que algo dejó de tener forma cerrada.
 
-4. **La producción es lineal en la población.** Es el contrato de `BuildingDef`. Un edificio con
+5. **La producción es lineal en la población.** Es el contrato de `BuildingDef`. Un edificio con
    producción no lineal rompe el integrador y con él el progreso offline. Si hace falta una no
    linealidad, se modela como **evento de segmento**, no como fórmula.
 
-5. **GDScript puro, nunca C#.** El export web de Godot no soporta C#, y navegador es objetivo de
+6. **GDScript puro, nunca C#.** El export web de Godot no soporta C#, y navegador es objetivo de
    primera. El binario instalado es `4.7.stable.mono`, pero eso no habilita nada aquí.
 
-6. **Modelo ≠ vista.** Todo el estado en `WorldState` (RefCounted, ids propios estables). Las
+7. **Modelo ≠ vista.** Todo el estado en `WorldState` (RefCounted, ids propios estables). Las
    escenas y la UI solo leen. La UI muta llamando a `SimEngine` / los sistemas, nunca escribiendo
    en `WorldState`. IA y jugador usan **las mismas funciones**.
 
-7. **Renderer Compatibility y `MultiMeshInstance2D`.** Es lo que hace que el juego corra en
+8. **Renderer Compatibility y `MultiMeshInstance2D`.** Es lo que hace que el juego corra en
    navegador y en móvil de gama baja. Nada de un nodo de escena por habitante.
 
-8. **El save es binario.** `JSON.stringify` pierde el último bit de los dobles incluso con
+9. **El save es binario.** `JSON.stringify` pierde el último bit de los dobles incluso con
    `full_precision`, y eso rompe el determinismo al continuar una partida. Para inspeccionar hay
    `Save.export_json`, que no es el formato de guardado.
 
@@ -80,5 +86,6 @@ Los invariantes que cubren:
 | Mismo seed + mismas acciones ⇒ mismo `state_hash()` | `determinism_test.gd` |
 | La multitud converge al agregado, sin saltos ni rebarajado | `crowd_test.gd` |
 | La economía tiene equilibrio, y también sabe colapsar | `economy_test.gd` |
+| Sin delegar no se destina ni se compra nada solo | `economy_test.gd` |
 | Avanzar N×1 ciclo == avanzar N ciclos de un salto | `offline_test.gd` |
 | Guardar y cargar no altera un solo bit | `save_test.gd` |

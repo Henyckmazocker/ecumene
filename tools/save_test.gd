@@ -45,6 +45,9 @@ func _init() -> void:
 	# --- Los bonos de legado se aplican de verdad ---
 	failures += _legacy_applies()
 
+	# --- Migración v1 → v2: los pesos de oficio pasan a ser trabajadores ---
+	failures += _migrates_job_weights()
+
 	# --- Un save de una versión futura se rechaza en vez de corromper la partida ---
 	var future := {"schema": WorldState.SCHEMA_VERSION + 99}
 	failures += TestUtil.check(
@@ -55,6 +58,46 @@ func _init() -> void:
 
 	Save.erase()
 	TestUtil.finish(self, failures)
+
+
+## Un save de antes del cambio de oficios tiene que seguir abriéndose.
+##
+## En v1 `jobs` era un peso relativo que el motor normalizaba al vuelo; en v2 es el número de
+## trabajadores destinados. Sin migrar, un save viejo con pesos `[1, 1]` se leería como «un
+## granjero y un leñador» en un pueblo de 200 habitantes, y la partida se hundiría al abrirla.
+func _migrates_job_weights() -> int:
+	var farm := Content.building_index("farm")
+	var woodcutter := Content.building_index("woodcutter")
+	var jobs := []
+	jobs.resize(Content.building_count())
+	jobs.fill(0.0)
+	jobs[farm] = 3.0        # 75 % del peso
+	jobs[woodcutter] = 1.0  # 25 %
+
+	var old_save := {
+		"schema": 1,
+		"nodes": [{"pop": 100.0, "jobs": jobs}],
+	}
+	var migrated := Save.migrate(old_save)
+	if migrated.is_empty():
+		return TestUtil.check(false, "", "un save v1 se rechaza en vez de migrarse")
+
+	var result: Array = migrated["nodes"][0]["jobs"]
+	var failures := TestUtil.check(
+		int(migrated["schema"]) == WorldState.SCHEMA_VERSION,
+		"el save migrado queda marcado como esquema %d" % WorldState.SCHEMA_VERSION,
+		"la migración no actualiza el número de esquema"
+	)
+	failures += TestUtil.check(
+		int(result[farm]) == 75 and int(result[woodcutter]) == 25,
+		"pesos 3:1 con 100 habitantes → %d granjeros y %d leñadores" % [
+			int(result[farm]), int(result[woodcutter]),
+		],
+		"la migración reparte mal: %d granjeros y %d leñadores de 100 habitantes" % [
+			int(result[farm]), int(result[woodcutter]),
+		]
+	)
+	return failures
 
 
 func _legacy_applies() -> int:

@@ -39,7 +39,8 @@ func _ready() -> void:
 
 	hud.build_requested.connect(_on_build)
 	hud.speed_requested.connect(_on_speed)
-	hud.job_changed.connect(_on_job_changed)
+	hud.workers_changed.connect(_on_workers_changed)
+	hud.delegation_toggled.connect(_on_delegation_toggled)
 	# Conectar antes de arrancar: si no, el evento de fundación de la partida se pierde.
 	engine.cycle_advanced.connect(_on_cycle_advanced)
 	engine.events.event_pushed.connect(_on_event)
@@ -180,12 +181,25 @@ func _on_build(building_index: int) -> void:
 		_refresh_hud()
 
 
-func _on_job_changed(building_index: int, weight: float) -> void:
+func _on_workers_changed(building_index: int, amount: float) -> void:
+	var node := focused()
+	if node == null or node.is_delegated():
+		return
+	Construction.add_workers(node, building_index, amount)
+	view.refresh(node)
+	_refresh_hud()
+
+
+## Delegar y recuperar el mando. Sin esto no había forma de quitarle un nodo a un gobernador
+## una vez puesto, y el juego se quedaba comprando y repartiendo solo para siempre.
+func _on_delegation_toggled(delegated: bool) -> void:
 	var node := focused()
 	if node == null:
 		return
-	Construction.set_job_weight(node, building_index, weight)
-	view.refresh(node)
+	node.governor = Governor.balanced() if delegated else null
+	engine.events.push("governor", engine.state.cycle, node.id,
+		"%s pasa a manos de un gobernador" % node.name if delegated
+		else "Retomas el mando de %s" % node.name, {"delegated": delegated})
 	_refresh_hud()
 
 
