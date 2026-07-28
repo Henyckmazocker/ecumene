@@ -85,7 +85,7 @@ func tick(dt: float, offline: bool = false) -> void:
 	if state == null or dt <= 0.0:
 		return
 	var bonus := Ascension.bonuses(state)
-	var base := _modifiers(bonus, offline)
+	var base := _modifiers(bonus)
 	state.cycle += dt
 
 	# Orden determinista: nunca se itera el Dictionary de nodos directamente.
@@ -114,7 +114,15 @@ func catch_up(elapsed_seconds: float) -> float:
 	var bonus := Ascension.bonuses(state)
 	var cap := params.offline_cap_seconds + bonus.offline_cap_seconds
 	var credited := minf(elapsed_seconds, cap)
-	var cycles := credited / params.seconds_per_cycle
+
+	# La eficiencia offline escala **tiempo, no producción**. Escalarla como multiplicador de
+	# producción parece equivalente y no lo es: el consumo de comida por habitante no se
+	# escala (comer se come igual), así que al 50 % la granja producía menos de lo que come
+	# su propia gente y el techo alimentario caía a cero. Resultado: cerrar el juego
+	# extinguía el asentamiento. Acreditando la mitad del tiempo, la economía es idéntica a
+	# la online —solo hay menos de ella—, que es justo lo que "rinde la mitad" quiere decir.
+	var efficiency := minf(params.offline_efficiency + bonus.offline_rate, 1.0)
+	var cycles := credited * efficiency / params.seconds_per_cycle
 	if cycles <= 0.0:
 		return 0.0
 	tick(cycles, true)
@@ -124,15 +132,14 @@ func catch_up(elapsed_seconds: float) -> float:
 	return cycles
 
 
-func _modifiers(bonus: Ascension.Bonuses, offline: bool) -> Integrator.Modifiers:
+## Multiplicadores del legado. No hay variante offline: la ausencia se paga en tiempo
+## acreditado (ver `catch_up`), no tocando la economía.
+func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
 	var mods := Integrator.Modifiers.new()
 	mods.production = bonus.production
 	mods.food = bonus.food
 	mods.growth = bonus.growth
 	mods.housing = bonus.housing
-	if offline:
-		var efficiency := minf(params.offline_efficiency + bonus.offline_rate, 1.0)
-		mods = mods.scaled(efficiency)
 	return mods
 
 

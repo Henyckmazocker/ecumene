@@ -52,6 +52,17 @@ static func building_index(id: String) -> int:
 	return _building_index.get(id, -1)
 
 
+## Recursos que un nodo de este tier maneja (los suyos más los de todas las escalas por
+## debajo). La UI los usa para no enseñar recursos que el jugador aún no ha desbloqueado.
+static func goods_for_tier(tier_index: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	for i in range(0, mini(tier_index + 1, TIER_COUNT)):
+		for good in tier(i).goods:
+			if not out.has(good):
+				out.append(good)
+	return out
+
+
 ## Índices de los edificios disponibles en un tier (incluye los de tiers inferiores).
 static func buildings_for_tier(tier_index: int) -> PackedInt32Array:
 	var out := PackedInt32Array()

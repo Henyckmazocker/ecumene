@@ -69,30 +69,44 @@ func _segment_count() -> int:
 	)
 
 
-## El catch-up recorta por el tope de horas y aplica la penalización de eficiencia.
+## El catch-up recorta por el tope de horas y cobra la eficiencia **en tiempo acreditado**.
 func _cap_and_efficiency() -> int:
 	var failures := 0
 
 	var capped := TestUtil.make_engine(11)
-	var cap_cycles := capped.params.offline_cap_seconds / capped.params.seconds_per_cycle
-	var credited := capped.catch_up(capped.params.offline_cap_seconds * 10.0)
+	var p := capped.params
+	var expected := p.offline_cap_seconds * p.offline_efficiency / p.seconds_per_cycle
+	var credited := capped.catch_up(p.offline_cap_seconds * 10.0)
 	failures += TestUtil.check(
-		absf(credited - cap_cycles) < 1.0,
-		"tope offline: 10× el máximo se recorta a %0.f ciclos" % credited,
-		"el tope offline no recorta: %0.f ciclos acreditados" % credited
+		absf(credited - expected) < 1.0,
+		"tope offline: 10× el máximo acredita %0.f ciclos (24 h al 50 %%)" % credited,
+		"el tope offline acredita %0.f ciclos, se esperaban %0.f" % [credited, expected]
 	)
 
-	# Con eficiencia offline al 50 %, la producción tiene que quedarse corta frente al online.
-	# Se mide antes de que el almacén se llene: con los stocks a tope los dos dan lo mismo.
-	var online := TestUtil.make_engine(11)
-	var offline := TestUtil.make_engine(11)
-	online.tick(100.0, false)
-	offline.tick(100.0, true)
-	var on_wood := online.state.root().stocks[Goods.WOOD]
-	var off_wood := offline.state.root().stocks[Goods.WOOD]
+	# Estar fuera tiene que dar **menos mundo**, no un mundo distinto: la mitad de tiempo
+	# acreditado, con la misma economía. La regresión que esto fija era brutal — con la
+	# eficiencia aplicada a la producción, la granja rendía menos de lo que comía su gente,
+	# el techo alimentario caía a cero y cerrar el juego extinguía el asentamiento.
+	var away := TestUtil.make_engine(11)
+	var same := TestUtil.make_engine(11)
+	var seconds := 200.0 * away.params.seconds_per_cycle
+	away.catch_up(seconds)
+	same.tick(seconds * same.params.offline_efficiency / same.params.seconds_per_cycle)
+
+	var a := away.state.root()
+	var b := same.state.root()
 	failures += TestUtil.check(
-		off_wood < on_wood,
-		"penalización offline aplicada: madera %0.1f offline vs %0.1f online" % [off_wood, on_wood],
-		"la penalización offline no se aplica: %0.1f vs %0.1f" % [off_wood, on_wood]
+		TestUtil.rel_error(a.pop, b.pop) <= TOLERANCE,
+		"el offline es tiempo, no otra economía: pob %.4f == %.4f" % [a.pop, b.pop],
+		"volver de estar fuera da un estado distinto a simular ese tiempo: %.4f vs %.4f" % [
+			a.pop, b.pop,
+		]
+	)
+	failures += TestUtil.check(
+		a.pop > away.params.initial_pop and not a.starving,
+		"tras 200 ciclos fuera el asentamiento ha crecido a %.2f hab, sin hambruna" % a.pop,
+		"tras estar fuera el asentamiento se ha ido a %.3f hab (hambruna=%s)" % [
+			a.pop, a.starving,
+		]
 	)
 	return failures

@@ -12,11 +12,42 @@ const TestUtil := preload("res://tools/TestUtil.gd")
 
 func _init() -> void:
 	var failures := 0
+	failures += _starting_margin()
 	failures += _managed_survives()
 	failures += _mismanaged_starves()
 	failures += _promotion_reachable()
 	failures += _nesting_ceiling()
 	TestUtil.finish(self, failures)
+
+
+## El reparto de partida tiene que sostenerse **incluso con el peaje de delegación**.
+##
+## Hay un acantilado inherente al modelo: mientras una granja tiene puestos libres, su
+## producción es proporcional a la población igual que el consumo, así que si la producción
+## por trabajador queda por debajo del consumo por habitante, **ninguna población es
+## sostenible** y el techo alimentario es 0, no un número pequeño. Con los valores actuales
+## el margen del reparto inicial bajo un gobernador es de apenas el 2 %: cualquier retoque a
+## la baja en la granja, o a la baja en `governor_efficiency`, extingue asentamientos recién
+## fundados. Este test es el que avisa.
+func _starting_margin() -> int:
+	var engine := TestUtil.make_engine(1)
+	var node := engine.state.root()
+	var mods := Integrator.Modifiers.none().scaled(engine.params.governor_efficiency)
+	var seg := Integrator.build_segment(node, engine.params, mods)
+
+	var shares := Integrator.job_shares(node)
+	var farm := Content.building_index("farm")
+	var per_worker := shares[farm] * Content.building(farm).produces[Goods.FOOD] \
+		* engine.params.governor_efficiency
+	var margin := per_worker / engine.params.food_per_pop - 1.0
+
+	return TestUtil.check(
+		seg.housing > 0.0,
+		"el reparto inicial se sostiene delegado: margen alimentario %+.1f %%" % (margin * 100.0),
+		"el reparto inicial NO se sostiene delegado (techo %0.2f, margen %+.1f %%): un " % [
+			seg.housing, margin * 100.0,
+		] + "asentamiento recién fundado y delegado se extingue solo"
+	)
 
 
 ## Un asentamiento delegado en un gobernador equilibrado tiene que prosperar 5.000 ciclos.

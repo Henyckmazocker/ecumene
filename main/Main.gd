@@ -84,13 +84,16 @@ func _refresh() -> void:
 		engine.state.cycle, node.pop, node.total_pop, node.housing(engine.params),
 	])
 	var caps := node.storage_caps(engine.params)
+	# Solo los recursos que esta escala maneja: un asentamiento no tiene por qué saber que
+	# la cultura existe. Los que ya se tienen se enseñan aunque la escala haya cambiado.
+	var visible := Content.goods_for_tier(node.tier)
 	for i in Goods.COUNT:
-		if node.stocks[i] <= 0.0 and caps[i] == engine.params.base_storage:
+		if not visible.has(i) and node.stocks[i] <= 0.0:
 			continue
 		lines.append("  %s %s %0.1f / %s" % [
 			Goods.ICONS[i], Goods.NAMES[i], node.stocks[i],
 			"∞" if caps[i] == INF else "%0.f" % caps[i],
 		])
 	if node.starving:
-		lines.append("  ⚠️ HAMBRUNA")
+		lines.append("  ⚠️ HAMBRUNA — la comida limita a %0.1f habitantes" % node.pop)
 	_label.text = "\n".join(lines)
