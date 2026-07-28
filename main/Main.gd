@@ -6,6 +6,9 @@ extends Node
 ## llamando a `SimEngine` y a los sistemas — nunca escribiendo en `WorldState`.
 
 const AUTOSAVE_CYCLES := 30.0
+## Segundos de vida que se le dan al pueblo antes del primer fotograma, para que al enfocar un
+## nodo la gente ya esté repartida por sus asuntos en vez de amontonada donde nació.
+const WARM_UP_SECONDS := 12.0
 
 var engine: SimEngine
 var view: SettlementView
@@ -53,12 +56,15 @@ func _ready() -> void:
 func _maybe_capture() -> void:
 	var shot := ""
 	var cycles := 0.0
+	var hour := -1.0
 	var delegate := false
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--shot="):
 			shot = arg.substr(7)
 		elif arg.begins_with("--shot-cycles="):
 			cycles = float(arg.substr(14))
+		elif arg.begins_with("--shot-hour="):
+			hour = float(arg.substr(12))
 		elif arg == "--shot-governor":
 			delegate = true
 	if shot.is_empty():
@@ -75,7 +81,11 @@ func _maybe_capture() -> void:
 		_focus(engine.state.root())
 		view.refresh(focused())
 		_refresh_hud()
-	view.update_agents(engine.state.cycle)
+	# La captura tiene que adelantar también el **reloj visual**: son dos simulaciones y la
+	# hora del pueblo no depende del ciclo económico. `--shot-hour=13` fotografía el mediodía.
+	if hour >= 0.0:
+		view.set_hour(hour)
+	view.warm_up(WARM_UP_SECONDS)
 	# Dos fotogramas: uno para que los `Control` calculen su tamaño y otro para dibujarlos.
 	await RenderingServer.frame_post_draw
 	await RenderingServer.frame_post_draw
@@ -101,6 +111,9 @@ func _focus(node: SimNode) -> void:
 		return
 	_focused_id = node.id
 	view.show_node(node)
+	# Un pueblo cargado de una partida no puede verse vacío llenándose a cuentagotas: se
+	# puebla de golpe y se le dan unos segundos de vida para que nadie salga en la puerta.
+	view.warm_up(WARM_UP_SECONDS)
 	camera.frame(view.settlement_extent(), view.world_size(), _viewport_size())
 	_refresh_hud()
 
@@ -113,12 +126,13 @@ func focused() -> SimNode:
 	return engine.state.get_node_by_id(_focused_id) if engine.state != null else null
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if engine.state == null:
 		return
-	# Los agentes son función pura del ciclo de simulación, no del tiempo real: con la pausa
-	# puesta se quedan quietos solos, sin que haya que acordarse de pararlos.
-	view.update_agents(engine.state.cycle)
+	# **En tiempo real, no en ciclos.** El pueblo tiene su propio reloj: sigue vivo con la
+	# pausa puesta y no se acelera al poner ×8. Aquí también converge la multitud hacia lo
+	# que dicen los números, por segundos reales, no por ticks.
+	view.advance(delta)
 
 
 func _on_viewport_resized() -> void:

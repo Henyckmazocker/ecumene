@@ -3,8 +3,13 @@ extends Node2D
 
 ## La vista del nodo enfocado: terreno, edificios y habitantes.
 ##
-## Solo **lee** del estado. No escribe una sola propiedad de `WorldState`, y no podría aunque
-## quisiera: los agentes son funciones puras del ciclo de simulación (ver [Agent]).
+## Solo **lee** del estado. No escribe una sola propiedad de `WorldState`.
+##
+## Aquí conviven las dos simulaciones del proyecto. Los **edificios** son un reflejo directo
+## del agregado —se construye uno y aparece en el mismo fotograma—. La **multitud** no: tiene
+## su propio reloj y su propia inercia, y se acerca a lo que dictan los números poco a poco
+## (ver [Crowd] y [CrowdReconciler]). Esa asimetría es deliberada: lo que el jugador *decide*
+## tiene que responder al instante, y lo que el pueblo *es* tiene que verse vivir.
 ##
 ## Todo va por `MultiMeshInstance2D` —un nodo de escena por *tipo*, no por habitante—, que es
 ## lo que hace que cientos de personas quepan en el presupuesto de un móvil de gama baja.
@@ -14,8 +19,11 @@ const TILE := 16.0
 
 var terrain: TerrainGen.Terrain
 var layout: Layout.Result
+var crowd_params := CrowdParams.new()
 
-var _crowd: AgentMaterializer.Crowd
+var _crowd: Crowd
+var _reconciler := CrowdReconciler.new()
+var _node: SimNode = null
 var _terrain_sprite: Sprite2D
 var _building_meshes: Array[MultiMeshInstance2D] = []
 var _agent_mesh: MultiMeshInstance2D
@@ -89,30 +97,48 @@ func show_node(node: SimNode) -> void:
 		_terrain_sprite.texture = tex
 		_terrain_sprite.scale = Vector2.ONE * TILE
 		layout = null
-		_crowd = null
+		# Cambiar de nodo sí tira la multitud: es otro pueblo, otra gente.
+		_crowd = Crowd.new(node.seed ^ 0x9e3779b9)
+		_reconciler = CrowdReconciler.new()
+	_node = node
 	refresh(node)
 
 
-## Reconstruye lo que haya cambiado. Barato de llamar cada tick: si las firmas coinciden, no
-## hace nada.
+## Reconstruye los **edificios** si han cambiado. La multitud no se toca aquí: converge sola
+## en `advance()`, que es lo que impide que el pueblo se rebaraje cada vez que sube la
+## población.
 func refresh(node: SimNode) -> void:
 	if node == null or terrain == null:
 		return
+	_node = node
 	if layout == null or layout.signature != node.buildings:
 		layout = Layout.build(node, terrain)
 		_rebuild_buildings()
-		_crowd = null
-	if _crowd == null or not _crowd.matches(node):
-		_crowd = AgentMaterializer.materialize(node, layout, terrain.center())
-		_agent_mesh.multimesh.instance_count = _crowd.agents.size()
 
 
 func agent_count() -> int:
-	return _crowd.agents.size() if _crowd != null else 0
+	return _crowd.size() if _crowd != null else 0
 
 
 func represents() -> float:
 	return _crowd.represents if _crowd != null else 1.0
+
+
+func crowd() -> Crowd:
+	return _crowd
+
+
+func hour() -> float:
+	return _crowd.clock.hour() if _crowd != null else 0.0
+
+
+## Adelanta el reloj del pueblo hasta una hora concreta. Es para las capturas: poder
+## fotografiar el amanecer, el mediodía y la noche sin esperar dos minutos por cada una.
+func set_hour(target_hour: float) -> void:
+	if _crowd == null:
+		return
+	var day := float(_crowd.clock.day())
+	_crowd.clock.elapsed = (day + target_hour / 24.0) * crowd_params.seconds_per_day
 
 
 func _rebuild_buildings() -> void:
@@ -135,36 +161,65 @@ func _rebuild_buildings() -> void:
 		cursor[p.building] += 1
 
 
-## Coloca a los habitantes en el instante `cycle`. Se llama por fotograma, pero cada agente
-## cuesta una evaluación aritmética y un `set_instance_transform_2d`: sin física, sin árbol
-## de escena y sin estado que mantener.
-func update_agents(cycle: float) -> void:
-	if _crowd == null:
+## Avanza la vida del pueblo `delta` **segundos reales** y la dibuja.
+##
+## Se llama cada fotograma, y le da igual la velocidad de simulación y la pausa: el pueblo
+## sigue vivo mientras lo estés mirando. La convergencia hacia los números también se hace
+## aquí, por tiempo real, para que a ×8 no converja ocho veces más rápido.
+func advance(delta: float) -> void:
+	if _crowd == null or terrain == null:
 		return
+	_reconciler.sync(_crowd, _node, layout, terrain.center(), crowd_params, delta)
+	_crowd.advance(delta, crowd_params)
+	_draw_crowd()
+
+
+## Rellena la multitud de golpe y le da `seconds` de vida antes de dibujarla. Sirve para
+## cargar una partida sin que el pueblo se vea vacío, y para el modo de captura.
+func warm_up(seconds: float, step: float = 0.05) -> void:
+	if _crowd == null or terrain == null:
+		return
+	_reconciler.sync(_crowd, _node, layout, terrain.center(), crowd_params, step)
+	var steps := int(seconds / step)
+	for _i in steps:
+		_crowd.advance(step, crowd_params)
+	_draw_crowd()
+
+
+func _draw_crowd() -> void:
 	var mm := _agent_mesh.multimesh
+	if mm.instance_count != _crowd.size():
+		mm.instance_count = _crowd.size()
 	# Un pelo mayor que media celda de edificio: con el pueblo denso, la gente tiene que
-	# leerse por encima de los tejados o el hito no cumple su función.
+	# leerse por encima de los tejados.
 	var dot := Vector2.ONE * TILE * 0.36
-	for i in _crowd.agents.size():
-		var agent: Agent = _crowd.agents[i]
-		var sample := agent.sample(cycle)
-		var pos: Vector2 = sample[0] * TILE
-		mm.set_instance_transform_2d(i, Transform2D(0.0, dot, 0.0, pos))
-		mm.set_instance_color(i, _agent_color(agent, sample[1]))
+	for i in _crowd.villagers.size():
+		var villager: Villager = _crowd.villagers[i]
+		mm.set_instance_transform_2d(i,
+			Transform2D(0.0, dot, 0.0, villager.position * TILE))
+		mm.set_instance_color(i, _villager_color(villager))
 
 
-## El color dice el oficio; el brillo dice qué está haciendo. Quien vaguea se ve apagado, y
-## eso es información: significa que sobran brazos para los puestos que hay.
-static func _agent_color(agent: Agent, state: int) -> Color:
+## El color dice el oficio; el brillo dice qué está haciendo. Quien no tiene puesto se ve
+## apagado, y eso es información de juego: significa que sobran brazos para los puestos que
+## hay. La opacidad hace de desvanecimiento al llegar y al marcharse.
+static func _villager_color(villager: Villager) -> Color:
 	var base := Color(0.80, 0.80, 0.78)
-	if agent.job >= 0:
-		base = Content.building(agent.job).color
-	match state:
-		Agent.State.WORKING:
-			return base.lightened(0.45)
-		Agent.State.COMMUTE_OUT, Agent.State.COMMUTE_HOME:
-			return base.lightened(0.2)
-		Agent.State.IDLE:
-			return base.darkened(0.3).lerp(Color(0.45, 0.45, 0.45), 0.6)
+	if villager.job >= 0:
+		base = Content.building(villager.job).color
+	var color := base
+	match villager.activity:
+		Villager.Activity.WORKING:
+			color = base.lightened(0.45)
+		Villager.Activity.COMMUTING, Villager.Activity.ERRAND:
+			color = base.lightened(0.2)
+		Villager.Activity.CHATTING:
+			color = base.lightened(0.3)
+		Villager.Activity.SLEEPING:
+			color = base.darkened(0.62)
+		Villager.Activity.WANDERING, Villager.Activity.LINGERING, Villager.Activity.BREAK:
+			color = base.darkened(0.3).lerp(Color(0.45, 0.45, 0.45), 0.45)
 		_:
-			return base.darkened(0.5)
+			color = base.darkened(0.35)
+	color.a = villager.fade
+	return color
