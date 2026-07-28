@@ -17,6 +17,8 @@ signal speed_changed(index: int)
 signal state_replaced(state: WorldState)
 
 const CYCLE := 1.0
+## Tope de pasos en los que se trocea un catch-up con nodos delegados.
+const CATCHUP_STEPS := 64
 
 @export var params: SimParams
 
@@ -125,15 +127,40 @@ func catch_up(elapsed_seconds: float) -> float:
 	var cycles := credited * efficiency / params.seconds_per_cycle
 	if cycles <= 0.0:
 		return 0.0
-	tick(cycles, true)
+
+	# El avance del tiempo se compone; **las decisiones no**. Con un solo salto, un nodo
+	# delegado crecería hasta el techo de los edificios que tenía cuando cerraste el juego y
+	# el gobernador construiría todo de golpe al final, desperdiciando la ausencia entera.
+	# Con nodos delegados se trocea en pasos —acotados a 64, no uno por ciclo— para que
+	# construir y crecer se alternen. Sin delegar no hay decisiones que intercalar y se
+	# resuelve de un salto, que es lo barato.
+	var steps := 1
+	if _has_delegated():
+		steps = clampi(int(cycles / params.governor_interval), 1, CATCHUP_STEPS)
+	var chunk := cycles / float(steps)
+	for _i in steps:
+		tick(chunk, true)
 	events.push("offline", state.cycle, state.root_id,
 		"Vuelves tras %s: %d ciclos acreditados" % [_format_span(credited), int(cycles)],
 		{"seconds": credited, "cycles": cycles, "capped": elapsed_seconds > cap})
 	return cycles
 
 
+## Multiplicadores en vigor ahora mismo. La UI los usa para que el HUD enseñe exactamente las
+## tasas que la simulación está aplicando, no una aproximación paralela.
+func current_modifiers() -> Integrator.Modifiers:
+	return _modifiers(Ascension.bonuses(state))
+
+
 ## Multiplicadores del legado. No hay variante offline: la ausencia se paga en tiempo
 ## acreditado (ver `catch_up`), no tocando la economía.
+func _has_delegated() -> bool:
+	for id in state.ordered_ids():
+		if (state.nodes[id] as SimNode).is_delegated():
+			return true
+	return false
+
+
 func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
 	var mods := Integrator.Modifiers.new()
 	mods.production = bonus.production

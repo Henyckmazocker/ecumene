@@ -129,7 +129,8 @@ static func _make_building(
 	id: String, name: String, tier_min: int,
 	cost: Dictionary, cost_growth: float,
 	slots: float, produces: Dictionary, consumes: Dictionary,
-	housing: float, storage: Dictionary
+	housing: float, storage: Dictionary,
+	color: Color, footprint: Vector2, icon: String
 ) -> BuildingDef:
 	var b := BuildingDef.new()
 	b.id = id
@@ -142,6 +143,9 @@ static func _make_building(
 	b.consumes = Goods.of(consumes)
 	b.housing = housing
 	b.storage = Goods.of(storage)
+	b.color = color
+	b.footprint = footprint
+	b.icon = icon
 	return b
 
 
@@ -150,36 +154,44 @@ static func _build_buildings() -> void:
 		_make_building("hut", "Cabaña", SETTLEMENT,
 			{Goods.WOOD: 20.0}, 1.18,
 			0.0, {}, {},
-			5.0, {}),
+			5.0, {},
+			Color(0.75, 0.62, 0.45), Vector2(0.7, 0.7), "🛖"),
 		_make_building("farm", "Granja", SETTLEMENT,
 			{Goods.WOOD: 30.0}, 1.16,
 			3.0, {Goods.FOOD: 0.6}, {},
-			0.0, {}),
+			0.0, {},
+			Color(0.88, 0.76, 0.34), Vector2(1.5, 1.1), "🌾"),
 		_make_building("woodcutter", "Leñador", SETTLEMENT,
 			{Goods.WOOD: 15.0}, 1.16,
 			2.0, {Goods.WOOD: 0.4}, {},
-			0.0, {}),
+			0.0, {},
+			Color(0.55, 0.38, 0.24), Vector2(0.8, 0.8), "🪓"),
 		_make_building("storehouse", "Almacén", SETTLEMENT,
 			{Goods.WOOD: 60.0}, 1.25,
 			0.0, {}, {},
 			0.0, {Goods.FOOD: 200.0, Goods.WOOD: 200.0, Goods.STONE: 200.0,
-				Goods.TOOLS: 100.0, Goods.GOLD: 100.0}),
+				Goods.TOOLS: 100.0, Goods.GOLD: 100.0},
+			Color(0.62, 0.55, 0.44), Vector2(1.2, 1.0), "🏚️"),
 		_make_building("quarry", "Cantera", TOWN,
 			{Goods.WOOD: 80.0}, 1.18,
 			3.0, {Goods.STONE: 0.3}, {},
-			0.0, {}),
+			0.0, {},
+			Color(0.70, 0.70, 0.72), Vector2(1.4, 1.2), "⛏️"),
 		_make_building("workshop", "Taller", TOWN,
 			{Goods.WOOD: 40.0, Goods.STONE: 60.0}, 1.20,
 			2.0, {Goods.TOOLS: 0.15}, {Goods.WOOD: 0.2},
-			0.0, {}),
+			0.0, {},
+			Color(0.58, 0.64, 0.72), Vector2(1.0, 0.9), "🔨"),
 		_make_building("market", "Mercado", CITY,
 			{Goods.STONE: 120.0, Goods.TOOLS: 20.0}, 1.20,
 			4.0, {Goods.GOLD: 0.5}, {},
-			0.0, {}),
+			0.0, {},
+			Color(0.86, 0.60, 0.30), Vector2(1.6, 1.2), "🏪"),
 		_make_building("temple", "Templo", CITY,
 			{Goods.STONE: 150.0, Goods.TOOLS: 40.0}, 1.22,
 			2.0, {Goods.CULTURE: 0.3}, {Goods.GOLD: 0.1},
-			0.0, {}),
+			0.0, {},
+			Color(0.72, 0.56, 0.82), Vector2(1.1, 1.4), "⛩️"),
 	]
 	_building_index = {}
 	for i in _buildings.size():

@@ -31,6 +31,13 @@ extends Resource
 ## Capacidad de almacenamiento que aporta por ejemplar, por recurso.
 @export var storage: PackedFloat64Array = Goods.zeros()
 
+@export_group("Presentación")
+## Color plano del edificio y de quien trabaja en él: el oficio se lee por color.
+@export var color: Color = Color.WHITE
+## Huella en celdas del terreno.
+@export var footprint: Vector2 = Vector2(0.8, 0.8)
+@export var icon: String = "▪"
+
 
 ## Coste de construir el ejemplar número `owned + 1`.
 func cost_for(owned: int) -> PackedFloat64Array:

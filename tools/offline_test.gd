@@ -21,6 +21,7 @@ func _init() -> void:
 	failures += _compare(20000, "largo")
 	failures += _segment_count()
 	failures += _cap_and_efficiency()
+	failures += _delegated_grows_while_away()
 
 	TestUtil.finish(self, failures)
 
@@ -67,6 +68,51 @@ func _segment_count() -> int:
 		"coste acotado: 86.400 ciclos resueltos en %d segmentos" % segments,
 		"demasiados segmentos para 86.400 ciclos: %d" % segments
 	)
+
+
+## Un nodo delegado tiene que **construir mientras no estás**, no al volver.
+##
+## El avance del tiempo se compone; las decisiones no. De un solo salto, el nodo crecía hasta
+## el techo de los edificios que tenía al cerrar el juego y el gobernador construía todo de
+## golpe al final — la ausencia entera desperdiciada, que es justo lo contrario de la razón
+## por la que se delega. `catch_up` trocea en pasos acotados para que se alternen.
+func _delegated_grows_while_away() -> int:
+	var away := TestUtil.make_engine(31337)
+	away.state.root().governor = Governor.balanced()
+	# Ocho horas fuera.
+	away.catch_up(8.0 * 3600.0)
+	var node := away.state.root()
+
+	var failures := TestUtil.check(
+		node.building_total() > 20,
+		"ocho horas delegado construyen %d edificios y %.0f habitantes" % [
+			node.building_total(), node.pop,
+		],
+		"tras ocho horas delegado solo hay %d edificios y %.0f habitantes: las decisiones no " % [
+			node.building_total(), node.pop,
+		] + "se están intercalando con el crecimiento"
+	)
+
+	# Y la población tiene que haber aprovechado lo construido, no quedarse en el techo viejo.
+	var snap := Integrator.snapshot(node, away.params)
+	failures += TestUtil.check(
+		node.pop > 50.0 and node.pop <= snap.cap + 1.0,
+		"la población ha seguido al techo que se iba construyendo: %.1f de %.1f" % [
+			node.pop, snap.cap,
+		],
+		"la población (%.1f) no ha seguido al techo construido (%.1f)" % [node.pop, snap.cap]
+	)
+
+	# Sin delegar no hay decisiones que intercalar: se resuelve de un salto y punto.
+	var alone := TestUtil.make_engine(31337)
+	alone.catch_up(8.0 * 3600.0)
+	failures += TestUtil.check(
+		alone.state.root().building_total() == 2,
+		"un nodo sin delegar no construye solo mientras no estás",
+		"un nodo sin delegar ha construido %d edificios sin permiso" % \
+			alone.state.root().building_total()
+	)
+	return failures
 
 
 ## El catch-up recorta por el tope de horas y cobra la eficiencia **en tiempo acreditado**.

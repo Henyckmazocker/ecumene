@@ -53,7 +53,9 @@ class Modifiers:
 ## Un tramo de tiempo en el que la dinámica es lineal y tiene solución exacta.
 class Segment:
 	extends RefCounted
-	var housing: float = 0.0        ## techo de población (K de la logística)
+	var housing: float = 0.0        ## techo de población efectivo (K de la logística)
+	var raw_housing: float = 0.0    ## techo por alojamiento, antes de mirar la comida
+	var food_capacity: float = 0.0  ## a cuánta gente da de comer este reparto de trabajo
 	var rate: float = 0.0           ## r > 0 logística hacia K, r < 0 decaimiento exponencial
 	var starving: bool = false      ## la comida es el límite Y sobra población
 	var food_limited: bool = false  ## la comida manda por encima del alojamiento
@@ -147,8 +149,10 @@ static func build_segment(node: SimNode, params: SimParams, mods: Modifiers) -> 
 	# sistema entraría en un ciclo límite (crecer → hambruna → morir → crecer) que ni el
 	# integrador ni el jugador pueden leer, y que hace que un salto largo y muchos pasos
 	# cortos den resultados distintos.
-	seg.housing = minf(seg.housing, _food_capacity(food_slope, food_offset, params))
-	seg.food_limited = seg.housing < node.housing(params) * mods.housing - EPS
+	seg.raw_housing = seg.housing
+	seg.food_capacity = _food_capacity(food_slope, food_offset, params)
+	seg.housing = minf(seg.raw_housing, seg.food_capacity)
+	seg.food_limited = seg.housing < seg.raw_housing - EPS
 
 	# Stocks fijados: los que están a tope subiendo, o a cero bajando.
 	for i in Goods.COUNT:
@@ -187,6 +191,56 @@ static func _net(b: BuildingDef, good: int, mods: Modifiers) -> float:
 	if good == Goods.FOOD:
 		factor *= mods.food
 	return (b.produces[good] - b.consumes[good]) * factor
+
+
+## Lo que la UI necesita saber del estado ahora mismo, sin avanzar el tiempo.
+##
+## Se calcula con el mismo `build_segment` que usa la simulación: el HUD no puede enseñar una
+## tasa distinta de la que se está aplicando, y la única forma de garantizarlo es que salga
+## del mismo sitio.
+class Snapshot:
+	extends RefCounted
+	var housing: float = 0.0        ## techo por alojamiento
+	var food_capacity: float = 0.0  ## techo por comida (INF si la comida no limita)
+	var cap: float = 0.0            ## el que manda de los dos
+	var food_limited: bool = false
+	var starving: bool = false
+	var rates := Goods.zeros()      ## variación por ciclo de cada recurso, ahora mismo
+
+
+static func snapshot(node: SimNode, params: SimParams, mods: Modifiers = null) -> Snapshot:
+	if mods == null:
+		mods = Modifiers.none()
+	var seg := build_segment(node, params, mods)
+	var snap := Snapshot.new()
+	snap.housing = seg.raw_housing
+	snap.food_capacity = seg.food_capacity
+	snap.cap = seg.housing
+	snap.food_limited = seg.food_limited
+	snap.starving = seg.starving
+	for i in Goods.COUNT:
+		# Un stock fijado (a tope o a cero) no se mueve: enseñar su tasa teórica sería mentir.
+		snap.rates[i] = 0.0 if seg.pinned[i] == 1 else seg.slope[i] * node.pop + seg.offset[i]
+	return snap
+
+
+## Trabajadores efectivos por edificio: lo que el agregado usa de verdad, ya recortado por
+## los puestos disponibles. Es la cifra que los agentes visibles tienen que repartirse para
+## que lo que se ve en pantalla cuadre con lo que dicta el modelo.
+static func effective_workers(node: SimNode) -> PackedFloat64Array:
+	var out := PackedFloat64Array()
+	out.resize(node.buildings.size())
+	var shares := job_shares(node)
+	var pop := maxf(node.pop, 0.0)
+	for bi in node.buildings.size():
+		var count := node.buildings[bi]
+		if count <= 0 or shares[bi] <= 0.0:
+			continue
+		var b := Content.building(bi)
+		if not b.is_workplace():
+			continue
+		out[bi] = minf(shares[bi] * pop, b.worker_slots * float(count))
+	return out
 
 
 ## Reparto normalizado de la mano de obra entre los centros de trabajo existentes.

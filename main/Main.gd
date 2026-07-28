@@ -1,14 +1,19 @@
 extends Node
 
-## Arranque del juego. En M0 la vista es un panel de texto: el objetivo de este hito es que
-## el núcleo determinista corra, se guarde y acredite el tiempo offline. El terreno 2D, los
-## agentes y la cámara de zoom continuo llegan en M1–M3.
+## Arranque y cableado: simulación ↔ vista ↔ UI.
+##
+## Aquí está la única frontera del juego. La vista y el HUD **leen** del estado y **mutan**
+## llamando a `SimEngine` y a los sistemas — nunca escribiendo en `WorldState`.
 
 const AUTOSAVE_CYCLES := 30.0
 
 var engine: SimEngine
-var _label: Label
+var view: SettlementView
+var camera: SettlementCamera
+var hud: HUD
+
 var _next_autosave: float = AUTOSAVE_CYCLES
+var _focused_id: int = -1
 
 
 func _ready() -> void:
@@ -16,11 +21,67 @@ func _ready() -> void:
 	engine.name = "SimEngine"
 	add_child(engine)
 
-	_build_ui()
+	view = SettlementView.new()
+	view.name = "SettlementView"
+	add_child(view)
+
+	camera = SettlementCamera.new()
+	camera.name = "Camera"
+	camera.enabled = true
+	add_child(camera)
+
+	hud = HUD.new()
+	hud.name = "HUD"
+	add_child(hud)
+
+	hud.build_requested.connect(_on_build)
+	hud.speed_requested.connect(_on_speed)
+	hud.job_changed.connect(_on_job_changed)
 	# Conectar antes de arrancar: si no, el evento de fundación de la partida se pierde.
 	engine.cycle_advanced.connect(_on_cycle_advanced)
 	engine.events.event_pushed.connect(_on_event)
+
 	_load_or_start()
+	_focus(engine.state.root())
+	get_viewport().size_changed.connect(_on_viewport_resized)
+	_maybe_capture()
+
+
+## Modo de captura para verificar el apartado visual sin un humano delante:
+##   godot-4 --path . -- --shot=user://shot.png --shot-cycles=400
+## Adelanta la simulación los ciclos pedidos, guarda una imagen del viewport y sale.
+func _maybe_capture() -> void:
+	var shot := ""
+	var cycles := 0.0
+	var delegate := false
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--shot="):
+			shot = arg.substr(7)
+		elif arg.begins_with("--shot-cycles="):
+			cycles = float(arg.substr(14))
+		elif arg == "--shot-governor":
+			delegate = true
+	if shot.is_empty():
+		return
+	if delegate:
+		# Para ver un asentamiento hecho sin jugarlo a mano.
+		engine.state.root().governor = Governor.balanced()
+	if cycles > 0.0:
+		# En pasos, no de un salto: con un solo tick gigante el gobernador construiría todo
+		# al final y la captura no enseñaría un asentamiento, sino un solar recién edificado.
+		var step := 25.0
+		for _i in int(ceil(cycles / step)):
+			engine.tick(step)
+		_focus(engine.state.root())
+		view.refresh(focused())
+		_refresh_hud()
+	view.update_agents(engine.state.cycle)
+	# Dos fotogramas: uno para que los `Control` calculen su tamaño y otro para dibujarlos.
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	get_viewport().get_texture().get_image().save_png(shot)
+	print("captura guardada en %s" % ProjectSettings.globalize_path(shot))
+	get_tree().quit()
 
 
 func _load_or_start() -> void:
@@ -30,10 +91,93 @@ func _load_or_start() -> void:
 		engine.adopt(state)
 		var away: float = elapsed[0] if not elapsed.is_empty() else 0.0
 		if away > 0.0:
-			var cycles := engine.catch_up(away)
-			print("Ecumene: %0.f ciclos acreditados por %0.f s fuera." % [cycles, away])
+			engine.catch_up(away)
 	else:
 		engine.start(int(Time.get_unix_time_from_system()))
+
+
+func _focus(node: SimNode) -> void:
+	if node == null:
+		return
+	_focused_id = node.id
+	view.show_node(node)
+	camera.frame(view.settlement_extent(), view.world_size(), _viewport_size())
+	_refresh_hud()
+
+
+func _viewport_size() -> Vector2:
+	return Vector2(get_viewport().get_visible_rect().size)
+
+
+func focused() -> SimNode:
+	return engine.state.get_node_by_id(_focused_id) if engine.state != null else null
+
+
+func _process(_delta: float) -> void:
+	if engine.state == null:
+		return
+	# Los agentes son función pura del ciclo de simulación, no del tiempo real: con la pausa
+	# puesta se quedan quietos solos, sin que haya que acordarse de pararlos.
+	view.update_agents(engine.state.cycle)
+
+
+func _on_viewport_resized() -> void:
+	camera.frame(view.settlement_extent(), view.world_size(), _viewport_size())
+
+
+func _on_cycle_advanced(cycle: float) -> void:
+	var node := focused()
+	if node == null:
+		# El nodo enfocado ha desaparecido (colapso): volver a la raíz.
+		_focus(engine.state.root())
+		return
+	view.refresh(node)
+	# El pueblo crece: se reencuadra, salvo que el jugador esté mirando algo a su aire.
+	camera.reframe_if_untouched(view.settlement_extent(), view.world_size(), _viewport_size())
+	_refresh_hud()
+	if cycle >= _next_autosave:
+		_next_autosave = cycle + AUTOSAVE_CYCLES
+		Save.write(engine.state)
+
+
+func _refresh_hud() -> void:
+	var node := focused()
+	if node == null:
+		return
+	var snap := Integrator.snapshot(node, engine.params, engine.current_modifiers())
+	hud.refresh(node, engine.state, engine.params, snap, engine.speed_index,
+		view.agent_count(), view.represents())
+
+
+func _on_event(entry: Dictionary) -> void:
+	hud.push_event(String(entry["text"]))
+
+
+# ---------------------------------------------------------------------------
+# Acciones del jugador — todas por las mismas funciones que usa el gobernador
+# ---------------------------------------------------------------------------
+
+func _on_build(building_index: int) -> void:
+	var node := focused()
+	if node == null:
+		return
+	if Construction.build(node, building_index, engine.state.cycle, engine.events):
+		view.refresh(node)
+		_refresh_hud()
+
+
+func _on_job_changed(building_index: int, weight: float) -> void:
+	var node := focused()
+	if node == null:
+		return
+	Construction.set_job_weight(node, building_index, weight)
+	view.refresh(node)
+	_refresh_hud()
+
+
+func _on_speed(index: int) -> void:
+	engine.set_speed_index(index)
+	_refresh_hud()
 
 
 func _notification(what: int) -> void:
@@ -42,58 +186,3 @@ func _notification(what: int) -> void:
 		# único que garantiza que el tiempo offline se cuente desde el instante correcto.
 		if engine != null and engine.state != null:
 			Save.write(engine.state)
-
-
-func _on_cycle_advanced(cycle: float) -> void:
-	_refresh()
-	if cycle >= _next_autosave:
-		_next_autosave = cycle + AUTOSAVE_CYCLES
-		Save.write(engine.state)
-
-
-func _on_event(entry: Dictionary) -> void:
-	print("[%6.0f] %s" % [entry["cycle"], entry["text"]])
-
-
-# ---------------------------------------------------------------------------
-# UI provisional
-# ---------------------------------------------------------------------------
-
-func _build_ui() -> void:
-	var layer := CanvasLayer.new()
-	add_child(layer)
-
-	var root := MarginContainer.new()
-	root.set_anchors_preset(Control.PRESET_FULL_RECT)
-	for side in ["left", "top", "right", "bottom"]:
-		root.add_theme_constant_override("margin_" + side, 24)
-	layer.add_child(root)
-
-	_label = Label.new()
-	_label.add_theme_font_size_override("font_size", 16)
-	root.add_child(_label)
-
-
-func _refresh() -> void:
-	if engine.state == null:
-		return
-	var node := engine.state.root()
-	var lines := PackedStringArray()
-	lines.append("%s — %s (era %d)" % [node.name, node.def().name, engine.state.era])
-	lines.append("Ciclo %0.f · población %0.1f (subárbol %0.1f) · techo %0.f" % [
-		engine.state.cycle, node.pop, node.total_pop, node.housing(engine.params),
-	])
-	var caps := node.storage_caps(engine.params)
-	# Solo los recursos que esta escala maneja: un asentamiento no tiene por qué saber que
-	# la cultura existe. Los que ya se tienen se enseñan aunque la escala haya cambiado.
-	var visible := Content.goods_for_tier(node.tier)
-	for i in Goods.COUNT:
-		if not visible.has(i) and node.stocks[i] <= 0.0:
-			continue
-		lines.append("  %s %s %0.1f / %s" % [
-			Goods.ICONS[i], Goods.NAMES[i], node.stocks[i],
-			"∞" if caps[i] == INF else "%0.f" % caps[i],
-		])
-	if node.starving:
-		lines.append("  ⚠️ HAMBRUNA — la comida limita a %0.1f habitantes" % node.pop)
-	_label.text = "\n".join(lines)

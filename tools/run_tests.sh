@@ -15,7 +15,7 @@ echo "== compilando scripts =="
 echo "== smoke test de la escena =="
 "$GODOT" --headless --path . --quit-after 200 >/dev/null 2>&1 || { echo "FALLO en la escena"; FAILED=1; }
 
-for test in determinism economy offline save; do
+for test in determinism economy offline save agents; do
 	echo
 	echo "== ${test}_test =="
 	if ! "$GODOT" --headless --path . -s "res://tools/${test}_test.gd" 2>&1 | grep -E '^(OK|FALLO|===)'; then

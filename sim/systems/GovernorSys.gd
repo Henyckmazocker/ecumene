@@ -33,21 +33,31 @@ static func run(
 	return due
 
 
+## Urgencia que se suma al peso de la política cuando un recurso es **el cuello de botella
+## real**. Tiene que dominar a las prioridades: un gobernador puede ser mediocre, no puede
+## construir casas para gente a la que no da de comer.
+const URGENT := 1.5
+
+
 static func _decide(
 	state: WorldState, node: SimNode, params: SimParams, events: SimEventLog
 ) -> void:
 	var w := node.governor.normalized()
-	_rebalance_jobs(node, w)
-	_build_best(state, node, w, events)
+	# Mirar qué está limitando de verdad, con el mismo cálculo que usa la simulación.
+	var snap := Integrator.snapshot(node, params)
+	_rebalance_jobs(node, w, snap)
+	_build_best(state, node, w, snap, params, events)
 	if w[P_EXPANSION] > 0.25 and Promotion.can_found_child(state, node, params):
 		Promotion.found_child(state, node, params, events)
 
 
-## Reparte la mano de obra según las prioridades. El hambre manda: si el nodo está en
-## déficit, el peso de la comida se dispara pase lo que pase en la política.
-static func _rebalance_jobs(node: SimNode, w: PackedFloat64Array) -> void:
+## Reparte la mano de obra según las prioridades. La comida manda: si es ella la que pone el
+## techo, su peso sube pase lo que pase en la política.
+static func _rebalance_jobs(
+	node: SimNode, w: PackedFloat64Array, snap: Integrator.Snapshot
+) -> void:
 	var food_weight := w[P_FOOD]
-	if node.starving:
+	if snap.food_limited:
 		food_weight = maxf(food_weight, 0.7)
 	for bi in node.buildings.size():
 		if node.buildings[bi] <= 0:
@@ -65,14 +75,15 @@ static func _rebalance_jobs(node: SimNode, w: PackedFloat64Array) -> void:
 
 ## Construye el edificio más alineado con las prioridades que se pueda pagar.
 static func _build_best(
-	state: WorldState, node: SimNode, w: PackedFloat64Array, events: SimEventLog
+	state: WorldState, node: SimNode, w: PackedFloat64Array, snap: Integrator.Snapshot,
+	params: SimParams, events: SimEventLog
 ) -> void:
 	var best := -1
 	var best_score := 0.0
 	for bi in Content.buildings_for_tier(node.tier):
 		if not Construction.can_build(node, bi):
 			continue
-		var score := _score(Content.building(bi), w, node)
+		var score := _score(Content.building(bi), w, node, snap, params)
 		if score > best_score:
 			best_score = score
 			best = bi
@@ -80,23 +91,45 @@ static func _build_best(
 		Construction.build(node, best, state.cycle, events)
 
 
-static func _score(b: BuildingDef, w: PackedFloat64Array, node: SimNode) -> float:
+## La puntuación mezcla la política del jugador con el cuello de botella real.
+##
+## La versión anterior premiaba el alojamiento siempre, y el resultado era un gobernador que
+## levantaba seis cabañas y una sola granja: alojamiento para 40 personas y comida para 7. Sin
+## mirar cuál de los dos techos está por debajo, las prioridades por sí solas no bastan.
+static func _score(
+	b: BuildingDef, w: PackedFloat64Array, node: SimNode, snap: Integrator.Snapshot,
+	params: SimParams
+) -> float:
 	var score := 0.0
+
+	if b.produces[Goods.FOOD] > 0.0:
+		score += w[P_FOOD]
+		if snap.food_limited:
+			score += URGENT
+
 	if b.housing > 0.0:
 		score += w[P_GROWTH]
-		# Sin sitio donde meter gente el crecimiento se para: prioridad si está lleno.
-		if node.pop > 0.0 and node.total_pop > 0.0:
-			score += w[P_GROWTH]
-	if b.produces[Goods.FOOD] > 0.0:
-		score += w[P_FOOD] * (2.0 if node.starving else 1.0)
+		# Solo urge alojar si es el alojamiento lo que frena, y ya está casi lleno.
+		if not snap.food_limited and node.pop >= snap.housing * 0.85:
+			score += URGENT
+
 	if b.produces[Goods.WOOD] > 0.0:
 		score += w[P_GROWTH] * 0.5
+
 	for good in [Goods.STONE, Goods.TOOLS, Goods.GOLD, Goods.CULTURE]:
 		if b.produces[good] > 0.0:
 			score += w[P_INDUSTRY]
+
 	var storage_total := 0.0
 	for v in b.storage:
 		storage_total += v
 	if storage_total > 0.0:
 		score += w[P_INDUSTRY] * 0.4
+		# Un almacén lleno es producción tirada a la basura.
+		var caps := node.storage_caps(params)
+		for i in Goods.COUNT:
+			if caps[i] != INF and node.stocks[i] >= caps[i] - 0.001:
+				score += URGENT
+				break
+
 	return score
