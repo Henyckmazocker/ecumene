@@ -108,11 +108,16 @@ func tick(dt: float, offline: bool = false) -> void:
 	cycle_advanced.emit(state.cycle)
 
 
+## Informe de la última ausencia acreditada, para la pantalla de vuelta. `null` si no hubo.
+var last_offline: OfflineReport = null
+
+
 ## Acredita el tiempo transcurrido con el juego cerrado, en segundos reales.
 ## Devuelve los ciclos realmente acreditados (ya recortados por el tope).
 func catch_up(elapsed_seconds: float) -> float:
 	if state == null or elapsed_seconds <= 0.0:
 		return 0.0
+	var before := OfflineReport.snapshot(state)
 	var bonus := Ascension.bonuses(state)
 	var cap := params.offline_cap_seconds + bonus.offline_cap_seconds
 	var credited := minf(elapsed_seconds, cap)
@@ -140,6 +145,9 @@ func catch_up(elapsed_seconds: float) -> float:
 	var chunk := cycles / float(steps)
 	for _i in steps:
 		tick(chunk, true)
+
+	last_offline = OfflineReport.build(before, state, params, credited, cycles,
+		elapsed_seconds > cap)
 	events.push("offline", state.cycle, state.root_id,
 		"Vuelves tras %s: %d ciclos acreditados" % [_format_span(credited), int(cycles)],
 		{"seconds": credited, "cycles": cycles, "capped": elapsed_seconds > cap})

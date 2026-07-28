@@ -28,6 +28,7 @@ var _terrain_sprite: Sprite2D
 var _building_meshes: Array[MultiMeshInstance2D] = []
 var _agent_mesh: MultiMeshInstance2D
 var _node_id: int = -1
+var _tier: int = -1
 var _quad: QuadMesh
 
 
@@ -61,25 +62,24 @@ func _make_multimesh(modulate_color: Color) -> MultiMeshInstance2D:
 	return inst
 
 
-## Tamaño del mapa en píxeles de mundo, para acotar el paneo de la cámara.
-func world_size() -> float:
-	return float(terrain.size) * TILE if terrain != null else 0.0
-
-
-func center_world() -> Vector2:
-	return Vector2.ONE * world_size() * 0.5
+## La ventana de terreno visible, en píxeles y **centrada en el origen del mundo**. Acota el
+## paneo de la cámara, y crece al promocionar.
+func terrain_bounds() -> Rect2:
+	if terrain == null:
+		return Rect2()
+	var half := float(terrain.extent()) * TILE
+	return Rect2(-Vector2.ONE * half, Vector2.ONE * half * 2.0)
 
 
 ## Lo que hay que tener en pantalla: la mancha construida, no el mapa entero.
 ##
 ## Encuadrar el mapa completo era el defecto obvio y estaba mal: a esa distancia los
 ## habitantes son un píxel y desaparece justamente lo que este juego tiene que enseñar. El
-## encuadre por defecto es el asentamiento, y alejarse hasta ver la isla es cosa del jugador.
+## encuadre por defecto es el asentamiento, y alejarse hasta ver el mundo es cosa del jugador.
 func settlement_extent() -> Rect2:
-	var center := center_world()
 	# Mínimo de 22 celdas de lado: un asentamiento recién fundado no puede llenar la pantalla
 	# con dos edificios, pero tampoco tiene que verse desde el espacio.
-	var rect := Rect2(center - Vector2.ONE * TILE * 11.0, Vector2.ONE * TILE * 22.0)
+	var rect := Rect2(-Vector2.ONE * TILE * 11.0, Vector2.ONE * TILE * 22.0)
 	if layout != null:
 		for p in layout.placements:
 			rect = rect.expand((Vector2(p.cell) + Vector2(0.5, 0.5)) * TILE)
@@ -92,25 +92,42 @@ func show_node(node: SimNode) -> void:
 		return
 	if node.id != _node_id:
 		_node_id = node.id
-		terrain = TerrainGen.generate(node.seed, node.tier)
-		var tex := ImageTexture.create_from_image(TerrainGen.to_image(terrain))
-		_terrain_sprite.texture = tex
-		_terrain_sprite.scale = Vector2.ONE * TILE
 		layout = null
 		# Cambiar de nodo sí tira la multitud: es otro pueblo, otra gente.
 		_crowd = Crowd.new(node.seed ^ 0x9e3779b9)
 		_reconciler = CrowdReconciler.new()
+		_tier = -1
 	_node = node
+	_ensure_terrain(node)
 	refresh(node)
+
+
+## Genera (o **amplía**) la ventana de terreno. Al promocionar solo cambia el tamaño de la
+## ventana: como la generación está anclada en coordenadas de mundo, todo lo que ya se veía
+## sale idéntico y alrededor aparece mundo nuevo. Los edificios y la gente ni se enteran,
+## porque sus posiciones también son coordenadas de mundo.
+func _ensure_terrain(node: SimNode) -> void:
+	if terrain != null and _tier == node.tier:
+		return
+	_tier = node.tier
+	terrain = TerrainGen.generate(node.seed, node.tier)
+	_terrain_sprite.texture = ImageTexture.create_from_image(TerrainGen.to_image(terrain))
+	_terrain_sprite.scale = Vector2.ONE * TILE
+	# La esquina de la textura cae en el borde de la ventana, no en el origen del mundo.
+	_terrain_sprite.position = -Vector2.ONE * float(terrain.extent()) * TILE
+	# El layout se rehace porque puede haber sitio nuevo, pero es determinista y estable:
+	# los edificios que ya estaban vuelven a las mismas coordenadas de mundo.
+	layout = null
 
 
 ## Reconstruye los **edificios** si han cambiado. La multitud no se toca aquí: converge sola
 ## en `advance()`, que es lo que impide que el pueblo se rebaraje cada vez que sube la
 ## población.
 func refresh(node: SimNode) -> void:
-	if node == null or terrain == null:
+	if node == null:
 		return
 	_node = node
+	_ensure_terrain(node)
 	if layout == null or layout.signature != node.buildings:
 		layout = Layout.build(node, terrain)
 		_rebuild_buildings()
@@ -169,7 +186,7 @@ func _rebuild_buildings() -> void:
 func advance(delta: float) -> void:
 	if _crowd == null or terrain == null:
 		return
-	_reconciler.sync(_crowd, _node, layout, terrain.center(), crowd_params, delta)
+	_reconciler.sync(_crowd, _node, layout, crowd_params, delta)
 	_crowd.advance(delta, crowd_params)
 	_draw_crowd()
 
@@ -179,7 +196,7 @@ func advance(delta: float) -> void:
 func warm_up(seconds: float, step: float = 0.05) -> void:
 	if _crowd == null or terrain == null:
 		return
-	_reconciler.sync(_crowd, _node, layout, terrain.center(), crowd_params, step)
+	_reconciler.sync(_crowd, _node, layout, crowd_params, step)
 	var steps := int(seconds / step)
 	for _i in steps:
 		_crowd.advance(step, crowd_params)

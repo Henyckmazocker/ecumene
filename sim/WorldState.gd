@@ -140,6 +140,8 @@ func state_hash() -> int:
 			buf.append_array(_i64(v))
 		for v in n.jobs:
 			buf.append_array(_f64(v))
+		for upgrade_id in n.upgrades:
+			buf.append_array(upgrade_id.to_utf8_buffer())
 	return _fnv1a(buf)
 
 

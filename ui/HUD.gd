@@ -18,6 +18,8 @@ signal speed_requested(index: int)
 ## Mover gente a un oficio (`amount` negativo la saca).
 signal workers_changed(building_index: int, amount: float)
 signal delegation_toggled(delegated: bool)
+signal promotion_requested()
+signal upgrade_requested(id: String)
 
 const IDLE_COLOR := Color(0.62, 0.62, 0.60)
 const WARN_COLOR := Color(0.85, 0.35, 0.30)
@@ -26,6 +28,12 @@ const OK_COLOR := Color(0.65, 0.80, 0.62)
 var _title: Label
 var _pop_bar: PopulationBar
 var _pop_label: Label
+var _promotion_box: HBoxContainer
+var _promotion_label: Label
+var _promotion_button: Button
+var _upgrade_panel: PanelContainer
+var _upgrade_box: VBoxContainer
+var _upgrade_buttons: Dictionary = {}
 var _resource_rows: Dictionary = {}
 var _resource_box: VBoxContainer
 var _build_box: HBoxContainer
@@ -38,6 +46,8 @@ var _delegate_button: Button
 var _speed_buttons: Array[Button] = []
 ## Cuánta gente mueve cada pulsación. Con miles de habitantes, ir de uno en uno es inviable.
 var _step: int = 1
+var _welcome: PanelContainer
+var _welcome_body: Label
 var _feed: Label
 var _feed_lines: PackedStringArray = PackedStringArray()
 
@@ -56,11 +66,68 @@ func _ready() -> void:
 	root.add_child(rows)
 
 	rows.add_child(_build_top())
-	var middle := Control.new()
+
+	# Franja central: el mundo se ve por debajo, y las mejoras se apoyan a la derecha para no
+	# tapar el pueblo ni competir con la zona del pulgar.
+	var middle := HBoxContainer.new()
 	middle.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	middle.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	rows.add_child(middle)
+
+	var gap := Control.new()
+	gap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	middle.add_child(gap)
+	middle.add_child(_build_upgrades())
+
 	rows.add_child(_build_bottom())
+	_build_welcome()
+
+
+## Pantalla de vuelta. Un panel modal, descartable de un toque.
+##
+## El catch-up ya funcionaba y era **invisible**: volvías y los números eran otros sin que
+## nadie te contara nada. En un idle, lo que pasó mientras no estabas es la mitad del juego.
+func _build_welcome() -> void:
+	_welcome = PanelContainer.new()
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.06, 0.08, 0.09, 0.97)
+	style.set_border_width_all(2)
+	style.border_color = Color(0.35, 0.45, 0.40)
+	for corner in ["top_left", "top_right", "bottom_left", "bottom_right"]:
+		style.set("corner_radius_" + corner, 10)
+	for side in ["left", "top", "right", "bottom"]:
+		style.set("content_margin_" + side, 24)
+	_welcome.add_theme_stylebox_override("panel", style)
+	_welcome.set_anchors_preset(Control.PRESET_CENTER)
+	_welcome.visible = false
+	add_child(_welcome)
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 10)
+	_welcome.add_child(box)
+
+	var title := Label.new()
+	title.text = "🌙 Mientras no estabas"
+	title.add_theme_font_size_override("font_size", 22)
+	box.add_child(title)
+
+	_welcome_body = Label.new()
+	_welcome_body.add_theme_font_size_override("font_size", 14)
+	box.add_child(_welcome_body)
+
+	var close := Button.new()
+	close.text = "Continuar"
+	close.custom_minimum_size = Vector2(0, 46)
+	close.pressed.connect(func() -> void: _welcome.visible = false)
+	box.add_child(close)
+
+
+func show_offline(report: OfflineReport) -> void:
+	if report == null or not report.has_anything_to_say():
+		return
+	_welcome_body.text = "\n".join(report.lines())
+	_welcome.visible = true
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +155,29 @@ func _build_top() -> Control:
 	_resource_box = VBoxContainer.new()
 	_resource_box.add_theme_constant_override("separation", 2)
 	box.add_child(_resource_box)
+
+	box.add_child(_build_promotion_row())
 	return panel
+
+
+## El eje vertical del juego, siempre a la vista.
+##
+## Mientras no se cumple el umbral enseña **cuánto falta**: en un incremental, saber a qué
+## distancia está el próximo salto es la mitad del enganche. Cuando se cumple, se convierte en
+## el botón más llamativo de la pantalla.
+func _build_promotion_row() -> Control:
+	_promotion_box = HBoxContainer.new()
+	_promotion_box.add_theme_constant_override("separation", 12)
+
+	_promotion_label = Label.new()
+	_promotion_label.add_theme_font_size_override("font_size", 13)
+	_promotion_box.add_child(_promotion_label)
+
+	_promotion_button = Button.new()
+	_promotion_button.custom_minimum_size = Vector2(0, 40)
+	_promotion_button.pressed.connect(func() -> void: promotion_requested.emit())
+	_promotion_box.add_child(_promotion_button)
+	return _promotion_box
 
 
 func _build_bottom() -> Control:
@@ -135,6 +224,65 @@ func _build_bottom() -> Control:
 	_build_box.add_theme_constant_override("separation", 6)
 	box.add_child(_build_box)
 	return panel
+
+
+## Panel de mejoras. Enseña las que **están a la vista** (escala y requisitos cumplidos),
+## aunque todavía no se puedan pagar: saber qué viene después es la mitad del enganche.
+func _build_upgrades() -> Control:
+	_upgrade_panel = _panel()
+	_upgrade_panel.size_flags_horizontal = Control.SIZE_SHRINK_END
+	_upgrade_panel.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_upgrade_panel.custom_minimum_size = Vector2(300, 0)
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+	_upgrade_panel.add_child(box)
+
+	var title := Label.new()
+	title.text = "🔬 Mejoras"
+	title.add_theme_font_size_override("font_size", 15)
+	box.add_child(title)
+
+	_upgrade_box = VBoxContainer.new()
+	_upgrade_box.add_theme_constant_override("separation", 4)
+	box.add_child(_upgrade_box)
+	return _upgrade_panel
+
+
+func _refresh_upgrades(node: SimNode) -> void:
+	var available := Upgrading.available_for(node)
+	_upgrade_panel.visible = not available.is_empty()
+
+	var seen := {}
+	for def in available:
+		var d: Upgrades.Def = def
+		seen[d.id] = true
+		if not _upgrade_buttons.has(d.id):
+			_upgrade_buttons[d.id] = _make_upgrade_button(d)
+		var button: Button = _upgrade_buttons[d.id]
+		button.visible = true
+		button.disabled = node.is_delegated() or not Upgrading.can_afford(node, d.id)
+		button.text = "%s %s\n%s" % [d.icon, d.name, _cost_of(d.cost)]
+	for id in _upgrade_buttons:
+		if not seen.has(id):
+			(_upgrade_buttons[id] as Button).visible = false
+
+
+func _make_upgrade_button(def: Upgrades.Def) -> Button:
+	var button := Button.new()
+	button.custom_minimum_size = Vector2(0, 46)
+	button.tooltip_text = def.describe()
+	button.pressed.connect(func() -> void: upgrade_requested.emit(def.id))
+	_upgrade_box.add_child(button)
+	return button
+
+
+static func _cost_of(cost: PackedFloat64Array) -> String:
+	var parts := PackedStringArray()
+	for i in Goods.COUNT:
+		if cost[i] > 0.0:
+			parts.append("%.0f %s" % [cost[i], Goods.ICONS[i]])
+	return " ".join(parts)
 
 
 ## Cabecera del reparto: cuánta gente está sin destinar, con qué paso se mueve, y quién manda.
@@ -217,6 +365,8 @@ func refresh(node: SimNode, state: WorldState, params: SimParams, snap: Integrat
 	_pop_label.modulate = WARN_COLOR if snap.starving else Color.WHITE
 
 	_refresh_resources(node, params, snap)
+	_refresh_promotion(node, state)
+	_refresh_upgrades(node)
 	_refresh_jobs(node)
 	_refresh_builds(node)
 	for i in _speed_buttons.size():
@@ -248,6 +398,53 @@ func _refresh_resources(node: SimNode, params: SimParams, snap: Integrator.Snaps
 			Goods.ICONS[i], Goods.NAMES[i], node.stocks[i], cap_text, rate,
 		]
 		row.modulate = Color.WHITE if rate >= 0.0 else WARN_COLOR
+
+
+func _refresh_promotion(node: SimNode, state: WorldState) -> void:
+	var tier_def := node.def()
+	if tier_def.promote_pop <= 0.0:
+		_promotion_box.visible = false
+		return
+	_promotion_box.visible = true
+
+	var next_name := Content.tier(node.tier + 1).name
+	var ready := Promotion.can_promote(state, node)
+	_promotion_button.visible = ready
+	if ready:
+		_promotion_button.text = "⬆️  Ascender a %s" % next_name
+		_promotion_label.text = Content.tier(node.tier + 1).unlocks
+		_promotion_label.modulate = OK_COLOR
+		return
+
+	# Bloqueado por el techo de anidamiento: cumple el umbral pero su padre no da más de sí.
+	if tier_def.can_promote(node.total_pop, node.building_total()):
+		_promotion_label.text = "⛔ %s no puede pasar de %s estando bajo su capital" % [
+			node.name, tier_def.name,
+		]
+		_promotion_label.modulate = WARN_COLOR
+		return
+
+	_promotion_label.text = "⬆️ %s: %s hab · %d/%d edificios" % [
+		next_name,
+		_progress(node.total_pop, tier_def.promote_pop),
+		node.building_total(), tier_def.promote_buildings,
+	]
+	_promotion_label.modulate = Color(1, 1, 1, 0.75)
+
+
+static func _progress(current: float, target: float) -> String:
+	return "%s/%s" % [_short(current), _short(target)]
+
+
+## Números grandes legibles: en un incremental se llega a millones enseguida.
+static func _short(value: float) -> String:
+	if value >= 1.0e9:
+		return "%.2f G" % (value / 1.0e9)
+	if value >= 1.0e6:
+		return "%.2f M" % (value / 1.0e6)
+	if value >= 10000.0:
+		return "%.1f k" % (value / 1000.0)
+	return "%.0f" % value
 
 
 ## Una fila por oficio con **botones de más y menos**. Es la decisión más frecuente del juego,
@@ -349,12 +546,7 @@ func _refresh_builds(node: SimNode) -> void:
 
 
 static func _cost_text(node: SimNode, building_index: int) -> String:
-	var cost := Construction.cost_of(node, building_index)
-	var parts := PackedStringArray()
-	for i in Goods.COUNT:
-		if cost[i] > 0.0:
-			parts.append("%.0f %s" % [cost[i], Goods.ICONS[i]])
-	return " ".join(parts)
+	return _cost_of(Construction.cost_of(node, building_index))
 
 
 func push_event(text: String) -> void:

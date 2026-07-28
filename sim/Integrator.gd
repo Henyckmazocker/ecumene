@@ -37,6 +37,8 @@ class Modifiers:
 	var food: float = 1.0         ## extra solo sobre la producción de comida
 	var growth: float = 1.0       ## sobre la tasa de crecimiento de población
 	var housing: float = 1.0      ## sobre el techo de población
+	## Multiplicador de producción por tipo de edificio. Vacío = todo a 1.
+	var per_building := PackedFloat64Array()
 
 	static func none() -> Modifiers:
 		return Modifiers.new()
@@ -47,7 +49,26 @@ class Modifiers:
 		m.food = food
 		m.growth = growth
 		m.housing = housing
+		m.per_building = per_building.duplicate()
 		return m
+
+	## Compone los bonos globales (legado) con las mejoras **de este nodo**. Los efectos que
+	## solo pueden venir del nodo —puestos y almacenamiento— no pasan por aquí: los aplican
+	## `Construction.capacity_of` y `SimNode.storage_caps` leyendo la caché del nodo.
+	func combined(effects: Upgrades.Effects) -> Modifiers:
+		var m := Modifiers.new()
+		m.production = production * effects.production
+		m.food = food * effects.food
+		m.growth = growth * effects.growth
+		m.housing = housing  # `SimNode.housing()` ya aplica el de las mejoras
+		m.per_building = effects.per_building.duplicate()
+		if per_building.size() == m.per_building.size():
+			for i in m.per_building.size():
+				m.per_building[i] *= per_building[i]
+		return m
+
+	func for_building(index: int) -> float:
+		return per_building[index] if index < per_building.size() else 1.0
 
 
 ## Un tramo de tiempo en el que la dinámica es lineal y tiene solución exacta.
@@ -98,7 +119,11 @@ static func advance(node: SimNode, params: SimParams, dt: float, mods: Modifiers
 
 
 ## Construye el tramo lineal válido a partir del estado actual del nodo.
-static func build_segment(node: SimNode, params: SimParams, mods: Modifiers) -> Segment:
+static func build_segment(node: SimNode, params: SimParams, base_mods: Modifiers) -> Segment:
+	# Los bonos globales (legado) se componen aquí con las mejoras propias del nodo: a partir
+	# de este punto hay un único juego de multiplicadores y nadie tiene que acordarse de
+	# aplicar dos.
+	var mods := base_mods.combined(node.effects())
 	var seg := Segment.new()
 	seg.housing = node.housing(params) * mods.housing
 	seg.caps = node.storage_caps(params)
@@ -121,13 +146,14 @@ static func build_segment(node: SimNode, params: SimParams, mods: Modifiers) -> 
 		if wanted[bi] <= 0.0:
 			continue
 		var b := Content.building(bi)
+		var boost := mods.for_building(bi)
 		if short_handed:
 			var share := wanted[bi] / wanted_total
 			for i in Goods.COUNT:
-				seg.slope[i] += share * _net(b, i, mods)
+				seg.slope[i] += share * _net(b, i, mods) * boost
 		else:
 			for i in Goods.COUNT:
-				seg.offset[i] += wanted[bi] * _net(b, i, mods)
+				seg.offset[i] += wanted[bi] * _net(b, i, mods) * boost
 
 	# La población a la que se cruza entre los dos regímenes es una frontera de tramo: por
 	# debajo del total asignado, los puestos dejan de cubrirse.
@@ -233,13 +259,11 @@ static func requested_workers(node: SimNode) -> PackedFloat64Array:
 	var out := PackedFloat64Array()
 	out.resize(node.buildings.size())
 	for bi in node.buildings.size():
-		var count := node.buildings[bi]
-		if count <= 0:
+		if node.buildings[bi] <= 0:
 			continue
-		var b := Content.building(bi)
-		if not b.is_workplace():
+		if not Content.building(bi).is_workplace():
 			continue
-		out[bi] = clampf(node.jobs[bi], 0.0, b.worker_slots * float(count))
+		out[bi] = clampf(node.jobs[bi], 0.0, node.capacity_of(bi))
 	return out
 
 

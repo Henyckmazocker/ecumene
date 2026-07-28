@@ -44,12 +44,9 @@ static func build(node: SimNode, building_index: int, cycle: float, events: SimE
 	return true
 
 
-## Puestos que caben en total en un tipo de edificio.
+## Puestos que caben en total en un tipo de edificio, con las mejoras aplicadas.
 static func capacity_of(node: SimNode, building_index: int) -> float:
-	var b := Content.building(building_index)
-	if not b.is_workplace():
-		return 0.0
-	return b.worker_slots * float(node.buildings[building_index])
+	return node.capacity_of(building_index)
 
 
 ## Personas que hay sin destinar a ningún oficio.

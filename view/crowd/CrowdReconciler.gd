@@ -29,8 +29,7 @@ var _first_sync: bool = true
 
 ## Acerca `crowd` al estado de `node`. Devuelve `true` si tuvo que rellenar de golpe.
 func sync(
-	crowd: Crowd, node: SimNode, layout: Layout.Result, center: Vector2i,
-	params: CrowdParams, delta: float
+	crowd: Crowd, node: SimNode, layout: Layout.Result, params: CrowdParams, delta: float
 ) -> bool:
 	if node == null or layout == null:
 		return false
@@ -38,7 +37,7 @@ func sync(
 	# Los edificios nuevos aparecen **de inmediato** — eso sí tiene que ser instantáneo.
 	if crowd.places == null or _layout_signature != layout.signature:
 		_layout_signature = layout.signature.duplicate()
-		crowd.places = Places.from_layout(layout, center)
+		crowd.places = Places.from_layout(layout)
 		_rehome_from_plaza(crowd, params)
 
 	var bulk := _sync_population(crowd, node, params, delta)

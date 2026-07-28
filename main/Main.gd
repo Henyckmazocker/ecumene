@@ -41,12 +41,15 @@ func _ready() -> void:
 	hud.speed_requested.connect(_on_speed)
 	hud.workers_changed.connect(_on_workers_changed)
 	hud.delegation_toggled.connect(_on_delegation_toggled)
+	hud.promotion_requested.connect(_on_promote)
+	hud.upgrade_requested.connect(_on_upgrade)
 	# Conectar antes de arrancar: si no, el evento de fundación de la partida se pierde.
 	engine.cycle_advanced.connect(_on_cycle_advanced)
 	engine.events.event_pushed.connect(_on_event)
 
 	_load_or_start()
 	_focus(engine.state.root())
+	hud.show_offline(engine.last_offline)
 	get_viewport().size_changed.connect(_on_viewport_resized)
 	_maybe_capture()
 
@@ -59,6 +62,7 @@ func _maybe_capture() -> void:
 	var cycles := 0.0
 	var hour := -1.0
 	var delegate := false
+	var promote := false
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--shot="):
 			shot = arg.substr(7)
@@ -68,6 +72,8 @@ func _maybe_capture() -> void:
 			hour = float(arg.substr(12))
 		elif arg == "--shot-governor":
 			delegate = true
+		elif arg == "--shot-promote":
+			promote = true
 	if shot.is_empty():
 		return
 	if delegate:
@@ -82,6 +88,8 @@ func _maybe_capture() -> void:
 		_focus(engine.state.root())
 		view.refresh(focused())
 		_refresh_hud()
+	if promote:
+		_on_promote()
 	# La captura tiene que adelantar también el **reloj visual**: son dos simulaciones y la
 	# hora del pueblo no depende del ciclo económico. `--shot-hour=13` fotografía el mediodía.
 	if hour >= 0.0:
@@ -115,7 +123,7 @@ func _focus(node: SimNode) -> void:
 	# Un pueblo cargado de una partida no puede verse vacío llenándose a cuentagotas: se
 	# puebla de golpe y se le dan unos segundos de vida para que nadie salga en la puerta.
 	view.warm_up(WARM_UP_SECONDS)
-	camera.frame(view.settlement_extent(), view.world_size(), _viewport_size())
+	camera.frame(view.settlement_extent(), view.terrain_bounds(), _viewport_size())
 	_refresh_hud()
 
 
@@ -137,7 +145,7 @@ func _process(delta: float) -> void:
 
 
 func _on_viewport_resized() -> void:
-	camera.frame(view.settlement_extent(), view.world_size(), _viewport_size())
+	camera.frame(view.settlement_extent(), view.terrain_bounds(), _viewport_size())
 
 
 func _on_cycle_advanced(cycle: float) -> void:
@@ -148,7 +156,7 @@ func _on_cycle_advanced(cycle: float) -> void:
 		return
 	view.refresh(node)
 	# El pueblo crece: se reencuadra, salvo que el jugador esté mirando algo a su aire.
-	camera.reframe_if_untouched(view.settlement_extent(), view.world_size(), _viewport_size())
+	camera.reframe_if_untouched(view.settlement_extent(), view.terrain_bounds(), _viewport_size())
 	_refresh_hud()
 	if cycle >= _next_autosave:
 		_next_autosave = cycle + AUTOSAVE_CYCLES
@@ -188,6 +196,32 @@ func _on_workers_changed(building_index: int, amount: float) -> void:
 	Construction.add_workers(node, building_index, amount)
 	view.refresh(node)
 	_refresh_hud()
+
+
+func _on_upgrade(id: String) -> void:
+	var node := focused()
+	if node == null or node.is_delegated():
+		return
+	if Upgrading.buy(node, id, engine.state.cycle, engine.events):
+		_refresh_hud()
+
+
+## Subir de escala: el eje vertical del juego.
+##
+## El mundo se abre. La ventana de terreno crece y aparece mundo nuevo alrededor, pero como la
+## generación está anclada en coordenadas absolutas, **lo que ya se veía sale idéntico** y ni
+## los edificios ni la gente se mueven un píxel. Solo cambia cuánto alcanzas a ver.
+func _on_promote() -> void:
+	var node := focused()
+	if node == null or not Promotion.can_promote(engine.state, node):
+		return
+	Promotion.promote(engine.state, node, engine.events)
+	view.refresh(node)
+	# Reencuadre incondicional: promocionar es el momento del juego, y merece que se vea el
+	# mundo nuevo aunque el jugador estuviera mirando un detalle.
+	camera.frame(view.settlement_extent(), view.terrain_bounds(), _viewport_size())
+	_refresh_hud()
+	Save.write(engine.state)
 
 
 ## Delegar y recuperar el mando. Sin esto no había forma de quitarle un nodo a un gobernador

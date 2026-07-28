@@ -20,9 +20,11 @@ var outskirts: PackedVector2Array = PackedVector2Array()
 const ERRAND_BUILDINGS := ["storehouse", "market"]
 
 
-static func from_layout(layout: Layout.Result, center: Vector2i) -> Places:
+static func from_layout(layout: Layout.Result) -> Places:
 	var places := Places.new()
-	places.plaza = Vector2(center) + Vector2(0.5, 0.5)
+	# El asentamiento vive en el origen del mundo: la plaza es el `(0, 0)`, mida lo que mida
+	# la ventana de terreno que se esté dibujando.
+	places.plaza = Vector2(0.5, 0.5)
 	if layout == null:
 		places.homes.append(places.plaza)
 		places.outskirts.append(places.plaza + Vector2(10.0, 0.0))

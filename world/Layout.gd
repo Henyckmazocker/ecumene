@@ -9,10 +9,15 @@ extends RefCounted
 ## anteriores — el mapa crece, no se baraja.
 ##
 ## Es puramente visual: el agregado no sabe ni le importa dónde está nada.
+##
+## Trabaja en **coordenadas de mundo** (el asentamiento está en el `(0, 0)`), no en índices de
+## celda. Es lo que permite que al promocionar crezca la ventana sin que se mueva nada: el
+## índice del centro pasa de 32 a 48, pero el mundo `(0, 0)` sigue siendo el mismo sitio.
 
 class Placement:
 	extends RefCounted
 	var building: int = -1
+	## Coordenada **de mundo**, no índice de celda.
 	var cell: Vector2i = Vector2i.ZERO
 
 
@@ -31,13 +36,20 @@ class Result:
 ## Radio máximo de búsqueda en anillos alrededor del centro.
 const MAX_RING := 64
 
+## Centinela de «no hay sitio». **No puede ser una coordenada plausible**: al pasar el layout a
+## coordenadas de mundo con signo, el `(-1, -1)` que se usaba antes se convirtió en una celda
+## perfectamente válida pegada al centro, y la colocación se rendía tras el tercer edificio
+## creyendo que el mapa estaba lleno.
+const NO_SPOT := Vector2i(0x7fffffff, 0x7fffffff)
+
 
 static func build(node: SimNode, terrain: TerrainGen.Terrain) -> Result:
 	var result := Result.new()
 	result.signature = node.buildings.duplicate()
 
 	var occupied := {}
-	var center := terrain.center()
+	# El asentamiento está en el origen del mundo, mida lo que mida la ventana.
+	var center := Vector2i.ZERO
 	occupied[center] = true  # el centro del asentamiento queda libre de edificios
 
 	# Orden fijo por índice de edificio y por ejemplar: es lo que hace que ampliar sea
@@ -50,7 +62,7 @@ static func build(node: SimNode, terrain: TerrainGen.Terrain) -> Result:
 		var cells: Array = []
 		for instance in count:
 			var cell := _find_spot(terrain, occupied, center, def.id, instance)
-			if cell == Vector2i(-1, -1):
+			if cell == NO_SPOT:
 				break  # no cabe más: el mapa se ha llenado
 			occupied[cell] = true
 			var p := Placement.new()
@@ -70,7 +82,7 @@ static func _find_spot(
 	terrain: TerrainGen.Terrain, occupied: Dictionary, center: Vector2i,
 	building_id: String, instance: int
 ) -> Vector2i:
-	var best := Vector2i(-1, -1)
+	var best := NO_SPOT
 	var best_score := -1.0
 	# Empezar el anillo donde toca por número de ejemplar: no hace falta rebarrer el núcleo
 	# ya lleno para colocar el edificio número 100.
@@ -79,7 +91,7 @@ static func _find_spot(
 		for cell in _ring_cells(center, ring):
 			if not terrain.is_buildable(cell) or occupied.has(cell):
 				continue
-			var score := Biomes.affinity(terrain.at_cell(cell), building_id)
+			var score := Biomes.affinity(terrain.at(cell), building_id)
 			if score <= 0.0:
 				continue
 			# Penalización suave por distancia: entre dos biomas igual de buenos, gana el

@@ -14,6 +14,8 @@ func _init() -> void:
 	var failures := 0
 	failures += _starting_margin()
 	failures += _nothing_happens_by_itself()
+	failures += _upgrades_work()
+	failures += _first_promotion_pacing()
 	failures += _managed_survives()
 	failures += _mismanaged_starves()
 	failures += _promotion_reachable()
@@ -125,6 +127,116 @@ func _nothing_happens_by_itself() -> int:
 		"hay %.0f trabajadores destinados con solo %.1f habitantes" % [total, node.pop]
 	)
 	return failures
+
+
+## Las mejoras aplican, respetan requisitos y cobran.
+func _upgrades_work() -> int:
+	var engine := TestUtil.make_engine(606)
+	var node := engine.state.root()
+	var farm := Content.building_index("farm")
+
+	# Una mejora de pueblo no está a la vista en un asentamiento.
+	var failures := TestUtil.check(
+		not Upgrading.is_available(node, "stone_tools"),
+		"las mejoras de pueblo no se ven en un asentamiento",
+		"una mejora de pueblo está disponible en un asentamiento"
+	)
+	# Ni una cuyo requisito no está comprado.
+	failures += TestUtil.check(
+		not Upgrading.is_available(node, "granary"),
+		"«Granero» está oculta sin su requisito «Rotación de cultivos»",
+		"«Granero» aparece sin cumplir su requisito"
+	)
+
+	# Por debajo del tope de almacén a propósito: un stock lleno está fijado y su tasa se
+	# enseña como 0, así que no se podría medir el efecto de la mejora.
+	node.stocks[Goods.FOOD] = 195.0
+	node.stocks[Goods.WOOD] = 195.0
+	var before_rate := Integrator.snapshot(node, engine.params).rates[Goods.FOOD]
+	var food_before := node.stocks[Goods.FOOD]
+
+	failures += TestUtil.check(
+		Upgrading.buy(node, "crop_rotation", 0.0, null),
+		"se compra «Rotación de cultivos»",
+		"no se puede comprar una mejora disponible y pagable"
+	)
+	failures += TestUtil.check(
+		node.stocks[Goods.FOOD] == food_before - 150.0,
+		"y cuesta sus 150 de comida",
+		"el coste no se ha cobrado: %.0f → %.0f" % [food_before, node.stocks[Goods.FOOD]]
+	)
+
+	var after_rate := Integrator.snapshot(node, engine.params).rates[Goods.FOOD]
+	var farm_boost := Content.building(farm).produces[Goods.FOOD] * node.jobs[farm] * 0.30
+	failures += TestUtil.check(
+		TestUtil.rel_error(after_rate - before_rate, farm_boost) < 0.01,
+		"+30 %% en granjas se nota en la tasa: %+.2f → %+.2f por ciclo" % [
+			before_rate, after_rate,
+		],
+		"la mejora no cambia la producción: %+.3f → %+.3f" % [before_rate, after_rate]
+	)
+
+	# Y ahora sí se ve la que dependía de ella.
+	failures += TestUtil.check(
+		Upgrading.is_available(node, "granary"),
+		"comprarla desbloquea «Granero»",
+		"«Granero» sigue oculta tras comprar su requisito"
+	)
+
+	# Los puestos también son multiplicadores: nada de sumar +1 por fuera.
+	node.buildings[farm] = 4
+	var slots_before := node.capacity_of(farm)
+	node.upgrades.append("wide_paths")
+	node.invalidate_effects()
+	failures += TestUtil.check(
+		TestUtil.rel_error(node.capacity_of(farm), slots_before * 1.34) < 0.001,
+		"«Sendas anchas» multiplica los puestos: %.1f → %.1f" % [
+			slots_before, node.capacity_of(farm),
+		],
+		"el multiplicador de puestos no se aplica: %.1f → %.1f" % [
+			slots_before, node.capacity_of(farm),
+		]
+	)
+	return failures
+
+
+## **El ritmo de onboarding.** La primera promoción es donde el juego enseña su gancho —el eje
+## de escalas—, así que no se deja al ojo: si algún ajuste de balance la aleja, esto avisa.
+##
+## Con un gobernador equilibrado tiene que caer entre los ciclos 600 y 1400 (10-23 min a ×1).
+## A mano será algo más lento, que es lo correcto.
+func _first_promotion_pacing() -> int:
+	var reached := PackedFloat64Array()
+	for seed_value in [11, 222, 3333, 44444]:
+		var engine := TestUtil.make_engine(seed_value)
+		var root := engine.state.root()
+		root.governor = Governor.balanced()
+		var at := -1.0
+		for _i in 120:
+			engine.tick(25.0)
+			if Promotion.can_promote(engine.state, root):
+				at = engine.state.cycle
+				break
+		reached.append(at)
+
+	var worst := 0.0
+	var best := INF
+	for at in reached:
+		if at < 0.0:
+			return TestUtil.check(false, "",
+				"alguna semilla no llega a Pueblo en 3.000 ciclos: %s" % [Array(reached)])
+		worst = maxf(worst, at)
+		best = minf(best, at)
+
+	return TestUtil.check(
+		best >= 600.0 and worst <= 1400.0,
+		"primera promoción entre los ciclos %0.f y %0.f (objetivo 600-1400, ~10-23 min)" % [
+			best, worst,
+		],
+		"el ritmo se ha desviado: primera promoción entre %0.f y %0.f, fuera de 600-1400" % [
+			best, worst,
+		]
+	)
 
 
 ## Un asentamiento delegado en un gobernador equilibrado tiene que prosperar 5.000 ciclos.

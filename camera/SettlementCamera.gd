@@ -12,7 +12,8 @@ const ZOOM_MIN := 0.35
 const ZOOM_MAX := 6.0
 const WHEEL_STEP := 1.12
 
-var bounds := Vector2.ZERO
+## Ventana de terreno visible, en píxeles y centrada en el origen del mundo.
+var bounds := Rect2()
 
 var _user_moved: bool = false
 var _dragging: bool = false
@@ -21,12 +22,12 @@ var _touches: Dictionary = {}
 var _pinch_distance: float = 0.0
 
 
-## Encuadra la mancha construida dentro de un mapa de lado `world_size`.
+## Encuadra la mancha construida dentro de la ventana de terreno.
 ##
 ## Lo que se encuadra es el asentamiento, **no el mapa**: a la distancia del mapa entero los
 ## habitantes miden un píxel y no se ve nada de lo que hace especial al juego.
-func frame(extent: Rect2, world_size: float, viewport: Vector2) -> void:
-	bounds = Vector2.ONE * world_size
+func frame(extent: Rect2, world_bounds: Rect2, viewport: Vector2) -> void:
+	bounds = world_bounds
 	position = extent.get_center()
 	if extent.size.x > 0.0 and extent.size.y > 0.0:
 		var fit := minf(viewport.x / extent.size.x, viewport.y / extent.size.y)
@@ -36,10 +37,12 @@ func frame(extent: Rect2, world_size: float, viewport: Vector2) -> void:
 
 ## Reencuadra solo si el jugador no ha tocado la cámara: crecer el pueblo no puede robarle
 ## el zoom a quien está mirando un detalle.
-func reframe_if_untouched(extent: Rect2, world_size: float, viewport: Vector2) -> void:
+func reframe_if_untouched(extent: Rect2, world_bounds: Rect2, viewport: Vector2) -> void:
+	bounds = world_bounds  # el mapa puede haber crecido aunque no toque reencuadrar
 	if _user_moved:
+		_clamp_position()
 		return
-	frame(extent, world_size, viewport)
+	frame(extent, world_bounds, viewport)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -128,11 +131,12 @@ func _zoom_at(screen_point: Vector2, factor: float) -> void:
 
 
 func _clamp_position() -> void:
-	if bounds == Vector2.ZERO:
+	if bounds.size == Vector2.ZERO:
 		return
 	var view := get_viewport_rect().size / zoom * 0.5
+	var center := bounds.get_center()
 	# Si el mapa cabe entero en pantalla, se queda centrado en vez de poder irse de paseo.
-	position.x = bounds.x * 0.5 if view.x >= bounds.x * 0.5 \
-		else clampf(position.x, view.x, bounds.x - view.x)
-	position.y = bounds.y * 0.5 if view.y >= bounds.y * 0.5 \
-		else clampf(position.y, view.y, bounds.y - view.y)
+	position.x = center.x if view.x * 2.0 >= bounds.size.x \
+		else clampf(position.x, bounds.position.x + view.x, bounds.end.x - view.x)
+	position.y = center.y if view.y * 2.0 >= bounds.size.y \
+		else clampf(position.y, bounds.position.y + view.y, bounds.end.y - view.y)

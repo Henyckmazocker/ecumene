@@ -16,7 +16,7 @@ extends Resource
 
 @export_group("Población")
 ## Crecimiento logístico por ciclo con superávit de comida.
-@export_range(0.0, 0.5, 0.001) var growth_rate: float = 0.02
+@export_range(0.0, 0.5, 0.001) var growth_rate: float = 0.035
 ## Decrecimiento exponencial por ciclo en hambruna.
 @export_range(0.0, 0.5, 0.001) var starvation_rate: float = 0.05
 ## Consumo de comida por habitante y ciclo.

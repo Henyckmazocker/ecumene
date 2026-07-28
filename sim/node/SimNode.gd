@@ -34,6 +34,9 @@ var buildings: PackedInt32Array = PackedInt32Array()
 ## la llena de gente, la llenas tú.
 var jobs: PackedFloat64Array = PackedFloat64Array()
 
+## Mejoras compradas en este nodo. Permanentes y por nodo.
+var upgrades: PackedStringArray = PackedStringArray()
+
 ## Está en déficit de comida (la población decrece). Lo fija el integrador.
 var starving: bool = false
 ## Gobernador al mando, o `null` si lo lleva el jugador.
@@ -43,6 +46,21 @@ var governor_last_cycle: float = 0.0
 
 ## Caché recalculada tras cada tick — nunca se serializa, se deriva.
 var total_pop: float = 0.0
+
+## Efectos de las mejoras, cacheados. `housing()`, `storage_caps()` y `capacity_of()` se
+## llaman en bucles calientes del HUD y del integrador, así que no se recalculan cada vez.
+var _effects: Upgrades.Effects = null
+
+
+## Multiplicadores de las mejoras de este nodo. Se recalcula solo cuando cambian.
+func effects() -> Upgrades.Effects:
+	if _effects == null:
+		_effects = Upgrades.compute(upgrades)
+	return _effects
+
+
+func invalidate_effects() -> void:
+	_effects = null
 
 
 static func create(node_id: int, node_tier: int, node_seed: int, node_name: String) -> SimNode:
@@ -73,20 +91,34 @@ func def() -> TierDef:
 	return Content.tier(tier)
 
 
+## Puestos de trabajo que caben en un tipo de edificio, con las mejoras aplicadas.
+##
+## Vive aquí y no en `Construction` a propósito: lo necesitan tanto el integrador como la UI,
+## y ponerlo en un sistema creaba un ciclo `Integrator` ⇄ `Construction` que GDScript no puede
+## resolver. Es una propiedad del nodo, así que este es su sitio.
+func capacity_of(building_index: int) -> float:
+	var b := Content.building(building_index)
+	if not b.is_workplace():
+		return 0.0
+	return b.worker_slots * float(buildings[building_index]) \
+		* effects().slots[building_index]
+
+
 ## Capacidad de alojamiento: el techo al que tiende la población.
 func housing(params: SimParams) -> float:
 	var h := params.base_housing
 	for i in buildings.size():
 		if buildings[i] > 0:
 			h += Content.building(i).housing * float(buildings[i])
-	return h
+	return h * effects().housing
 
 
 ## Tope de almacenamiento por recurso (INF para los recursos acumulativos).
 func storage_caps(params: SimParams) -> PackedFloat64Array:
+	var multiplier := effects().storage
 	var caps := Goods.zeros()
 	for i in Goods.COUNT:
-		caps[i] = INF if i in Goods.UNCAPPED else params.base_storage
+		caps[i] = INF if i in Goods.UNCAPPED else params.base_storage * multiplier
 	for bi in buildings.size():
 		var count := buildings[bi]
 		if count <= 0:
@@ -94,7 +126,7 @@ func storage_caps(params: SimParams) -> PackedFloat64Array:
 		var st := Content.building(bi).storage
 		for i in Goods.COUNT:
 			if caps[i] != INF:
-				caps[i] += st[i] * float(count)
+				caps[i] += st[i] * float(count) * multiplier
 	return caps
 
 
@@ -110,6 +142,7 @@ func duplicate_node() -> SimNode:
 	n.stocks = stocks.duplicate()
 	n.buildings = buildings.duplicate()
 	n.jobs = jobs.duplicate()
+	n.upgrades = upgrades.duplicate()
 	n.starving = starving
 	n.governor = governor.duplicate_governor() if governor != null else null
 	n.governor_last_cycle = governor_last_cycle
@@ -129,6 +162,7 @@ func to_dict() -> Dictionary:
 		"stocks": Array(stocks),
 		"buildings": Array(buildings),
 		"jobs": Array(jobs),
+		"upgrades": Array(upgrades),
 		"starving": starving,
 		"gov_cycle": governor_last_cycle,
 	}
@@ -149,6 +183,8 @@ static func from_dict(d: Dictionary) -> SimNode:
 	n.stocks = PackedFloat64Array(d["stocks"])
 	n.buildings = PackedInt32Array(d["buildings"])
 	n.jobs = PackedFloat64Array(d["jobs"])
+	# Saves anteriores a las mejoras simplemente no traen ninguna: no hace falta migración.
+	n.upgrades = PackedStringArray(d.get("upgrades", []))
 	n.starving = bool(d["starving"])
 	n.governor_last_cycle = float(d.get("gov_cycle", 0.0))
 	if d.has("governor"):

@@ -35,7 +35,7 @@ class Village:
 		var steps := int(seconds / STEP)
 		for _i in steps:
 			rebuild_layout()
-			reconciler.sync(crowd, node, layout, terrain.center(), params, STEP)
+			reconciler.sync(crowd, node, layout, params, STEP)
 			crowd.advance(STEP, params)
 
 
@@ -99,7 +99,7 @@ func _nobody_teleports() -> int:
 		if frame % 60 == 0:
 			v.engine.tick(25.0)  # la población sube y aparecen edificios mientras se mira
 		v.rebuild_layout()
-		v.reconciler.sync(v.crowd, v.node, v.layout, v.terrain.center(), v.params, STEP)
+		v.reconciler.sync(v.crowd, v.node, v.layout, v.params, STEP)
 		v.crowd.advance(STEP, v.params)
 
 		var current := {}
@@ -277,7 +277,7 @@ func _new_buildings_appear_at_once() -> int:
 	)
 
 	# Y la casa nueva entra en el reparto de viviendas sin esperar.
-	v.reconciler.sync(v.crowd, v.node, v.layout, v.terrain.center(), v.params, STEP)
+	v.reconciler.sync(v.crowd, v.node, v.layout, v.params, STEP)
 	failures += TestUtil.check(
 		v.crowd.places.homes.size() == v.node.buildings[Content.building_index("hut")],
 		"la cabaña nueva ya es una casa habitable (%d viviendas)" % v.crowd.places.homes.size(),

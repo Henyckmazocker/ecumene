@@ -22,6 +22,8 @@ func _init() -> void:
 	failures += _segment_count()
 	failures += _cap_and_efficiency()
 	failures += _delegated_grows_while_away()
+	failures += _the_return_is_reported()
+	failures += _upgrades_do_not_break_the_closed_form()
 
 	TestUtil.finish(self, failures)
 
@@ -113,6 +115,75 @@ func _delegated_grows_while_away() -> int:
 			alone.state.root().building_total()
 	)
 	return failures
+
+
+## Volver tiene que contarse. El catch-up funcionaba y era invisible.
+func _the_return_is_reported() -> int:
+	var engine := TestUtil.make_engine(4040)
+	engine.state.root().governor = Governor.balanced()
+	engine.catch_up(6.0 * 3600.0)
+	var report := engine.last_offline
+
+	var failures := TestUtil.check(
+		report != null and report.has_anything_to_say(),
+		"volver de seis horas genera informe",
+		"no se ha generado informe de la ausencia"
+	)
+	if report == null:
+		return failures
+	failures += TestUtil.check(
+		report.pop_after > report.pop_before and report.buildings_built > 0,
+		"el informe cuenta lo que pasó: %.0f → %.0f hab y %d edificios" % [
+			report.pop_before, report.pop_after, report.buildings_built,
+		],
+		"el informe no recoge el crecimiento (%.0f → %.0f, %d edificios)" % [
+			report.pop_before, report.pop_after, report.buildings_built,
+		]
+	)
+
+	# Y un nodo **sin delegar** que se quedó en su techo tiene que salir señalado: es el
+	# argumento honesto para delegar, y esconderlo sería vender el idle a medias.
+	var alone := TestUtil.make_engine(4040)
+	alone.catch_up(6.0 * 3600.0)
+	failures += TestUtil.check(
+		not alone.last_offline.idle_nodes.is_empty(),
+		"y avisa de lo perdido por no delegar: %s parado en su techo" % \
+			alone.last_offline.idle_nodes[0],
+		"un nodo parado en su techo seis horas no se señala en el informe"
+	)
+	return failures
+
+
+## **El guardián de la regla dura de las mejoras.** Todos sus efectos son multiplicadores
+## constantes; si alguno dejara de serlo, la forma cerrada se rompería y esto lo cazaría.
+func _upgrades_do_not_break_the_closed_form() -> int:
+	var stepwise := TestUtil.make_engine(9090)
+	var jump := TestUtil.make_engine(9090)
+	for engine in [stepwise, jump]:
+		var node: SimNode = engine.state.root()
+		node.upgrades = PackedStringArray([
+			"sharp_axes", "crop_rotation", "granary", "sturdy_frames", "shared_hearth",
+			"wide_paths",
+		])
+		node.invalidate_effects()
+
+	for _i in 5000:
+		stepwise.tick(1.0)
+	jump.tick(5000.0)
+
+	var a := stepwise.state.root()
+	var b := jump.state.root()
+	var worst := TestUtil.rel_error(a.pop, b.pop)
+	for i in Goods.COUNT:
+		worst = maxf(worst, TestUtil.rel_error(a.stocks[i], b.stocks[i]))
+
+	return TestUtil.check(
+		worst <= TOLERANCE,
+		"con las 6 mejoras compradas, offline == online sigue exacto (error %s)" % \
+			TestUtil.sci(worst),
+		"alguna mejora ha roto la linealidad: error %s entre online y offline" % \
+			TestUtil.sci(worst)
+	)
 
 
 ## El catch-up recorta por el tope de horas y cobra la eficiencia **en tiempo acreditado**.
