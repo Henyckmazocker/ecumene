@@ -63,6 +63,7 @@ func _maybe_capture() -> void:
 	var hour := -1.0
 	var delegate := false
 	var promote := false
+	var tab := -1
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--shot="):
 			shot = arg.substr(7)
@@ -74,6 +75,8 @@ func _maybe_capture() -> void:
 			delegate = true
 		elif arg == "--shot-promote":
 			promote = true
+		elif arg.begins_with("--shot-tab="):
+			tab = int(arg.substr(11))
 	if shot.is_empty():
 		return
 	if delegate:
@@ -92,6 +95,8 @@ func _maybe_capture() -> void:
 		_on_promote()
 	# La captura tiene que adelantar también el **reloj visual**: son dos simulaciones y la
 	# hora del pueblo no depende del ciclo económico. `--shot-hour=13` fotografía el mediodía.
+	if tab >= 0:
+		hud.select_tab(tab)
 	if hour >= 0.0:
 		view.set_hour(hour)
 	view.warm_up(WARM_UP_SECONDS)

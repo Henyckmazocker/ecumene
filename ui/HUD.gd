@@ -25,18 +25,22 @@ const IDLE_COLOR := Color(0.62, 0.62, 0.60)
 const WARN_COLOR := Color(0.85, 0.35, 0.30)
 const OK_COLOR := Color(0.65, 0.80, 0.62)
 
+const TAB_JOBS := 0
+const TAB_BUILD := 1
+const TAB_UPGRADES := 2
+
 var _title: Label
 var _pop_bar: PopulationBar
 var _pop_label: Label
 var _promotion_box: HBoxContainer
 var _promotion_label: Label
 var _promotion_button: Button
-var _upgrade_panel: PanelContainer
-var _upgrade_box: VBoxContainer
+var _tabs: TabContainer
+var _upgrade_box: HFlowContainer
 var _upgrade_buttons: Dictionary = {}
 var _resource_rows: Dictionary = {}
 var _resource_box: VBoxContainer
-var _build_box: HBoxContainer
+var _build_box: HFlowContainer
 var _build_buttons: Dictionary = {}
 var _job_box: VBoxContainer
 var _job_rows: Dictionary = {}
@@ -67,18 +71,11 @@ func _ready() -> void:
 
 	rows.add_child(_build_top())
 
-	# Franja central: el mundo se ve por debajo, y las mejoras se apoyan a la derecha para no
-	# tapar el pueblo ni competir con la zona del pulgar.
-	var middle := HBoxContainer.new()
+	# Franja central libre: el mundo se ve entero entre los dos paneles.
+	var middle := Control.new()
 	middle.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	middle.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	rows.add_child(middle)
-
-	var gap := Control.new()
-	gap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	gap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	middle.add_child(gap)
-	middle.add_child(_build_upgrades())
 
 	rows.add_child(_build_bottom())
 	_build_welcome()
@@ -121,6 +118,12 @@ func _build_welcome() -> void:
 	close.custom_minimum_size = Vector2(0, 46)
 	close.pressed.connect(func() -> void: _welcome.visible = false)
 	box.add_child(close)
+
+
+## Selecciona una pestaña. Lo usa el modo de captura para poder fotografiar las tres.
+func select_tab(index: int) -> void:
+	if _tabs != null and index >= 0 and index < _tabs.get_tab_count():
+		_tabs.current_tab = index
 
 
 func show_offline(report: OfflineReport) -> void:
@@ -180,6 +183,17 @@ func _build_promotion_row() -> Control:
 	return _promotion_box
 
 
+## El panel de gestión: una sola caja con **tres pestañas**.
+##
+## Antes los oficios y la construcción compartían el panel inferior y las mejoras vivían en un
+## panel flotante a la derecha. Tres superficies compitiendo por el mismo sitio: el panel
+## inferior crecía sin control al construirse edificios nuevos, y en móvil vertical no cabía.
+## En pestañas cada una tiene el alto que necesita y el marco no se mueve al cambiar de una a
+## otra.
+##
+## Lo **global** —cuánta gente hay sin destinar, quién manda, y a qué velocidad corre el
+## juego— se queda fuera de las pestañas: no pertenece a ninguna y hace falta verlo mientras se
+## trabaja en cualquiera.
 func _build_bottom() -> Control:
 	var panel := _panel()
 	var box := VBoxContainer.new()
@@ -191,67 +205,112 @@ func _build_bottom() -> Control:
 	_feed.modulate = Color(1, 1, 1, 0.6)
 	box.add_child(_feed)
 
-	# Oficios y velocidad en la misma fila: el panel inferior se comía media pantalla, y en
-	# móvil vertical eso es directamente inviable.
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 24)
-	box.add_child(row)
+	box.add_child(_build_global_row())
 
-	var jobs_column := VBoxContainer.new()
-	jobs_column.add_theme_constant_override("separation", 4)
-	jobs_column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(jobs_column)
-	jobs_column.add_child(_build_jobs_header())
+	_tabs = TabContainer.new()
+	# Alto fijo: cambiar de pestaña no puede mover el marco ni tapar más mundo de golpe.
+	_tabs.custom_minimum_size = Vector2(0, 148)
+	_tabs.tab_alignment = TabBar.ALIGNMENT_LEFT
+	box.add_child(_tabs)
 
-	_job_box = VBoxContainer.new()
-	_job_box.add_theme_constant_override("separation", 2)
-	jobs_column.add_child(_job_box)
-
-	var speeds := HBoxContainer.new()
-	speeds.add_theme_constant_override("separation", 6)
-	speeds.alignment = BoxContainer.ALIGNMENT_END
-	speeds.size_flags_vertical = Control.SIZE_SHRINK_END
-	for i in ["⏸", "▶", "▶▶", "▶▶▶", "▶▶▶▶"]:
-		var b := Button.new()
-		b.text = i
-		b.custom_minimum_size = Vector2(52, 44)  # el mínimo táctil de la guía de UX
-		b.pressed.connect(_on_speed.bind(_speed_buttons.size()))
-		speeds.add_child(b)
-		_speed_buttons.append(b)
-	row.add_child(speeds)
-
-	_build_box = HBoxContainer.new()
-	_build_box.add_theme_constant_override("separation", 6)
-	box.add_child(_build_box)
+	_tabs.add_child(_build_jobs_tab())
+	_tabs.add_child(_build_buildings_tab())
+	_tabs.add_child(_build_upgrades_tab())
+	_tabs.set_tab_title(TAB_JOBS, "👷 Oficios")
+	_tabs.set_tab_title(TAB_BUILD, "🔨 Construir")
+	_tabs.set_tab_title(TAB_UPGRADES, "🔬 Mejoras")
 	return panel
 
 
-## Panel de mejoras. Enseña las que **están a la vista** (escala y requisitos cumplidos),
-## aunque todavía no se puedan pagar: saber qué viene después es la mitad del enganche.
-func _build_upgrades() -> Control:
-	_upgrade_panel = _panel()
-	_upgrade_panel.size_flags_horizontal = Control.SIZE_SHRINK_END
-	_upgrade_panel.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	_upgrade_panel.custom_minimum_size = Vector2(300, 0)
+## Lo que no pertenece a ninguna pestaña porque hace falta en todas.
+func _build_global_row() -> Control:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 14)
 
-	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 6)
-	_upgrade_panel.add_child(box)
+	_idle_label = Label.new()
+	_idle_label.add_theme_font_size_override("font_size", 14)
+	_idle_label.custom_minimum_size = Vector2(160, 0)
+	row.add_child(_idle_label)
 
-	var title := Label.new()
-	title.text = "🔬 Mejoras"
-	title.add_theme_font_size_override("font_size", 15)
-	box.add_child(title)
+	_delegate_button = Button.new()
+	_delegate_button.custom_minimum_size = Vector2(0, 36)
+	_delegate_button.toggle_mode = true
+	_delegate_button.toggled.connect(func(on: bool) -> void: delegation_toggled.emit(on))
+	row.add_child(_delegate_button)
 
-	_upgrade_box = VBoxContainer.new()
-	_upgrade_box.add_theme_constant_override("separation", 4)
-	box.add_child(_upgrade_box)
-	return _upgrade_panel
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(spacer)
+
+	for i in ["⏸", "▶", "▶▶", "▶▶▶", "▶▶▶▶"]:
+		var b := Button.new()
+		b.text = i
+		b.custom_minimum_size = Vector2(52, 40)  # el mínimo táctil de la guía de UX
+		b.pressed.connect(_on_speed.bind(_speed_buttons.size()))
+		row.add_child(b)
+		_speed_buttons.append(b)
+	return row
+
+
+func _build_jobs_tab() -> Control:
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 6)
+
+	var step_row := HBoxContainer.new()
+	step_row.add_theme_constant_override("separation", 8)
+	var step_label := Label.new()
+	step_label.text = "Mover de"
+	step_label.add_theme_font_size_override("font_size", 12)
+	step_label.modulate = Color(1, 1, 1, 0.6)
+	step_row.add_child(step_label)
+	for amount in [1, 10, 100]:
+		var button := Button.new()
+		button.text = str(amount)
+		button.custom_minimum_size = Vector2(46, 32)
+		button.pressed.connect(_on_step.bind(amount))
+		step_row.add_child(button)
+		_step_buttons.append(button)
+	var en := Label.new()
+	en.text = "en " + str(_step)
+	en.visible = false
+	step_row.add_child(en)
+	column.add_child(step_row)
+
+	_job_box = VBoxContainer.new()
+	_job_box.add_theme_constant_override("separation", 2)
+	column.add_child(_job_box)
+	return _scrollable(column)
+
+
+func _build_buildings_tab() -> Control:
+	# Flujo, no fila: con ocho edificios en Ciudad una fila se sale de la pantalla en móvil.
+	_build_box = HFlowContainer.new()
+	_build_box.add_theme_constant_override("h_separation", 6)
+	_build_box.add_theme_constant_override("v_separation", 6)
+	return _scrollable(_build_box)
+
+
+## Las mejoras que **están a la vista** (escala y requisitos cumplidos), aunque todavía no se
+## puedan pagar: saber qué viene después es la mitad del enganche de un incremental.
+func _build_upgrades_tab() -> Control:
+	_upgrade_box = HFlowContainer.new()
+	_upgrade_box.add_theme_constant_override("h_separation", 6)
+	_upgrade_box.add_theme_constant_override("v_separation", 6)
+	return _scrollable(_upgrade_box)
+
+
+static func _scrollable(content: Control) -> ScrollContainer:
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(content)
+	return scroll
 
 
 func _refresh_upgrades(node: SimNode) -> void:
 	var available := Upgrading.available_for(node)
-	_upgrade_panel.visible = not available.is_empty()
+	# Sin mejoras a la vista, la pestaña desaparece en vez de quedarse vacía.
+	_tabs.set_tab_hidden(TAB_UPGRADES, available.is_empty())
 
 	var seen := {}
 	for def in available:
@@ -270,7 +329,7 @@ func _refresh_upgrades(node: SimNode) -> void:
 
 func _make_upgrade_button(def: Upgrades.Def) -> Button:
 	var button := Button.new()
-	button.custom_minimum_size = Vector2(0, 46)
+	button.custom_minimum_size = Vector2(190, 52)
 	button.tooltip_text = def.describe()
 	button.pressed.connect(func() -> void: upgrade_requested.emit(def.id))
 	_upgrade_box.add_child(button)
@@ -283,38 +342,6 @@ static func _cost_of(cost: PackedFloat64Array) -> String:
 		if cost[i] > 0.0:
 			parts.append("%.0f %s" % [cost[i], Goods.ICONS[i]])
 	return " ".join(parts)
-
-
-## Cabecera del reparto: cuánta gente está sin destinar, con qué paso se mueve, y quién manda.
-func _build_jobs_header() -> Control:
-	var header := HBoxContainer.new()
-	header.add_theme_constant_override("separation", 14)
-
-	_idle_label = Label.new()
-	_idle_label.add_theme_font_size_override("font_size", 14)
-	_idle_label.custom_minimum_size = Vector2(150, 0)
-	header.add_child(_idle_label)
-
-	var step_label := Label.new()
-	step_label.text = "paso"
-	step_label.add_theme_font_size_override("font_size", 12)
-	step_label.modulate = Color(1, 1, 1, 0.6)
-	header.add_child(step_label)
-
-	for amount in [1, 10, 100]:
-		var button := Button.new()
-		button.text = str(amount)
-		button.custom_minimum_size = Vector2(46, 32)
-		button.pressed.connect(_on_step.bind(amount))
-		header.add_child(button)
-		_step_buttons.append(button)
-
-	_delegate_button = Button.new()
-	_delegate_button.custom_minimum_size = Vector2(0, 32)
-	_delegate_button.toggle_mode = true
-	_delegate_button.toggled.connect(func(on: bool) -> void: delegation_toggled.emit(on))
-	header.add_child(_delegate_button)
-	return header
 
 
 func _on_step(amount: int) -> void:
