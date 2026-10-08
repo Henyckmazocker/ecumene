@@ -1,0 +1,220 @@
+{
+  "_comment": "Tableros de Augur que sube tools/augur-setup.sh (Plan «Integración con Augur», «Tableros» y M5). Cada gráfica es {title, definition, note?} con la ChartDefinition v1 de Augur. El script busca el tablero por nombre (sin distinguir mayúsculas) y la gráfica por título: cambiar un título crea una gráfica nueva y deja la vieja. Ritmo filtra siempre channel neq debug (neq existe en ChartDefinition y deja fuera solo los exports de depuración; NO se filtra channel eq release, que hoy dejaría los tableros vacíos). cycle se reinicia en cada era: lo que va por cycle o separa la era en series o filtra era = 1. El n de Augur cuenta sesiones, no eventos. Augur ordena un eje x de prop por orden de llegada (texto), no numérico: 3000 puede salir antes que 600.",
+  "boards": [
+    {
+      "name": "Ritmo",
+      "charts": [
+        {
+          "title": "Ciclo de cada promoción, por escala",
+          "note": "Media del ciclo en que un nodo llega a cada escala (tier = la escala nueva). Una serie por era, porque cycle se reinicia al ascender.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "promotion", "property": "cycle",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}],
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "era"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Ciclo de cada promoción, por autor (era 1)",
+          "note": "La misma media separada por quién promociona: el jugador a mano o el gobernador. Solo la primera era, para no mezclar ciclos de mundos con legado distinto.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "promotion", "property": "cycle",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}, {"prop": "era", "op": "eq", "value": 1}],
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "actor"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Promociones por escala y autor",
+          "note": "Recuento de la gráfica anterior sin filtrar era: el n de Augur cuenta sesiones, así que esto es el número real de promociones detrás de cada media.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "promotion",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}],
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "actor"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Población del subárbol en el tiempo",
+          "note": "pop medio de la raíz (depth = 0) en cada foto de node_sample, que sale cada 300 ciclos: el eje ya va en cubos de 300. Una serie por era. Augur ordena el eje como llega, no numérico.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "node_sample", "property": "pop",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}, {"prop": "depth", "op": "eq", "value": 0}],
+            "x": {"kind": "prop", "prop": "cycle"},
+            "series": {"kind": "prop", "prop": "era"},
+            "display": "line"
+          }
+        },
+        {
+          "title": "Qué limita a la raíz (era 1)",
+          "note": "Fotos de la raíz por ciclo y por cuello de botella (food | housing | none), con la misma vara que el HUD y el gobernador. Solo la primera era.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "node_sample",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}, {"prop": "depth", "op": "eq", "value": 0}, {"prop": "era", "op": "eq", "value": 1}],
+            "x": {"kind": "prop", "prop": "cycle"},
+            "series": {"kind": "prop", "prop": "limit"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Legado por ascensión",
+          "note": "Legado medio ganado al ascender según la escala más alta de la era que se deja. Vacía hasta que alguien ascienda.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "ascension", "property": "gained",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}],
+            "x": {"kind": "prop", "prop": "peak_tier"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Ausencias: segundos acreditados",
+          "note": "credited_s medio de offline_return según los nodos delegados al volver.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "offline_return", "property": "credited_s",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}],
+            "x": {"kind": "prop", "prop": "nodes_delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Ausencias: decisiones del gobernador",
+          "note": "Suma de decisions de offline_return según los nodos delegados al volver: lo que la IA hizo mientras no se miraba.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "sum", "event": "offline_return", "property": "decisions",
+            "where": [{"prop": "channel", "op": "neq", "value": "debug"}],
+            "x": {"kind": "prop", "prop": "nodes_delegated"},
+            "display": "bar"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Gobernador",
+      "charts": [
+        {
+          "title": "Qué construye la IA",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "build",
+            "where": [{"prop": "actor", "op": "eq", "value": "governor"}],
+            "x": {"kind": "prop", "prop": "building"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Construido vs. segundo candidato",
+          "note": "Decisiones que construyeron algo, por lo construido y el segundo candidato que descartó. Fuera de las ausencias (allí solo se cuentan).",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "governor_decision",
+            "where": [{"prop": "built", "op": "neq", "value": ""}],
+            "x": {"kind": "prop", "prop": "built"},
+            "series": {"kind": "prop", "prop": "runner_up"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Cuello de botella cuando decide",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "governor_decision",
+            "x": {"kind": "prop", "prop": "limit"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Ociosos: IA vs. a mano",
+          "note": "idle_share medio de node_sample por escala, delegado (true) o a mano (false). El n cuenta sesiones: los recuentos están en «Fotos de nodo por escala, delegadas o no».",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "node_sample", "property": "idle_share",
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Techo alcanzado: IA vs. a mano",
+          "note": "cap_use = pop / cap, ya calculado en node_sample.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "node_sample", "property": "cap_use",
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Cuánto delega el jugador",
+          "note": "delegation: delegar (true) frente a retomar el mando (false).",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "delegation",
+            "x": {"kind": "prop", "prop": "delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Fotos de nodo por escala, delegadas o no",
+          "note": "El % delegado por escala es la parte true de cada barra (Augur no saca porcentajes de una prop booleana). Es también el recuento detrás de las medias de ociosos y techo.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "node_sample",
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Expansión: fundaciones de la IA por escala",
+          "note": "found con actor = governor, por escala del hijo. Los hijos nacen huérfanos hasta el M5 de «Colonización a mano».",
+          "definition": {
+            "v": 1, "source": "event", "metric": "count", "event": "found",
+            "where": [{"prop": "actor", "op": "eq", "value": "governor"}],
+            "x": {"kind": "prop", "prop": "tier"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Expansión: hijos por nodo y escala",
+          "note": "children medio de node_sample por escala del nodo.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "node_sample", "property": "children",
+            "x": {"kind": "prop", "prop": "tier"},
+            "series": {"kind": "prop", "prop": "delegated"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Política: peso de comida",
+          "note": "w_food medio (normalizado) de la política en la que se queda el jugador, por versión.",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "governor_policy", "property": "w_food",
+            "x": {"kind": "session", "field": "client_version"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Política: peso de crecimiento",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "governor_policy", "property": "w_growth",
+            "x": {"kind": "session", "field": "client_version"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Política: peso de industria",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "governor_policy", "property": "w_industry",
+            "x": {"kind": "session", "field": "client_version"},
+            "display": "bar"
+          }
+        },
+        {
+          "title": "Política: peso de expansión",
+          "definition": {
+            "v": 1, "source": "event", "metric": "avg", "event": "governor_policy", "property": "w_expansion",
+            "x": {"kind": "session", "field": "client_version"},
+            "display": "bar"
+          }
+        }
+      ]
+    }
+  ]
+}

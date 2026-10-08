@@ -80,7 +80,18 @@ func _maybe_chat(villager: Villager, params: CrowdParams) -> void:
 
 ## Da de alta un habitante. `walk_in` lo hace entrar andando desde las afueras; sin él aparece
 ## ya instalado, que es lo que hace falta al cargar una partida o volver de estar fuera.
+##
+## Antes de crear a nadie se mira si alguien va camino de la salida y se le hace dar media
+## vuelta. La población **oscila** —una mala cosecha, un ciclo de hambre, el redondeo a puntos—
+## y sin esto cada bandazo costaba el doble: un habitante nuevo por cada uno que todavía tardaba
+## `fade_seconds` en desvanecerse. Los salientes no cuentan para el tope, así que se apilaban
+## por encima de él y se dibujaban igual: con la población meciéndose se llegaba a tres veces la
+## multitud que tocaba, toda ella pagando cada fotograma.
 func spawn(params: CrowdParams, walk_in: bool) -> Villager:
+	var returning := _turn_someone_back()
+	if returning != null:
+		return returning
+
 	var villager := Villager.new()
 	villager.setup(_rng, params)
 	villager.home = places.home_point(_rng)
@@ -96,6 +107,20 @@ func spawn(params: CrowdParams, walk_in: bool) -> Villager:
 		villager.fade = 1.0
 	villagers.append(villager)
 	return villager
+
+
+## El último que se marchó da media vuelta.
+##
+## Se coge el último a propósito: es el que menos camino lleva hacia la salida, así que
+## reincorporarlo no se ve como nadie cambiando de idea a media legua. Conserva su casa y su
+## oficio —volver no es llegar—, y decide de nuevo en el acto.
+func _turn_someone_back() -> Villager:
+	for i in range(villagers.size() - 1, -1, -1):
+		var villager := villagers[i]
+		if villager.departing:
+			villager.reinstate()
+			return villager
+	return null
 
 
 ## Manda a alguien fuera del pueblo. Se elige a quien no tiene puesto: que se vaya un ocioso
@@ -114,6 +139,33 @@ func retire_one() -> void:
 	if chosen < 0:
 		return
 	villagers[chosen].depart(places.nearest_outskirt(villagers[chosen].position))
+
+
+## Quita `count` habitantes **en el acto**, sin sacarlos andando.
+##
+## Es la baja del rellenado de golpe, que es simétrica del alta: si al llenar no entra nadie
+## andando, al vaciar tampoco puede salir nadie andando. Sacarlos con su desvanecimiento dejaba
+## el pueblo con el doble de gente dibujada durante `fade_seconds`, y justo cuando la vista ya
+## iba apurada.
+##
+## Un solo recorrido: `count` llamadas a [method retire_one] recorren la lista entera cada vez, y
+## es exactamente aquí donde eso se convierte en un fotograma perdido.
+func retire_many(count: int) -> void:
+	if count <= 0:
+		return
+	var remaining := count
+	var kept: Array[Villager] = []
+	# Se van primero los que ya se iban y los que no tienen puesto: vaciar una granja mientras el
+	# agregado dice que sigue llena es justamente mentir.
+	for villager in villagers:
+		if remaining > 0 and (villager.departing or not villager.has_work):
+			remaining -= 1
+			continue
+		kept.append(villager)
+	# Si no daban los ociosos, se completa con los más antiguos.
+	if remaining > 0:
+		kept.assign(kept.slice(mini(remaining, kept.size())))
+	villagers = kept
 
 
 func rng() -> RandomNumberGenerator:

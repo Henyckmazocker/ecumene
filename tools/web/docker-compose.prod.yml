@@ -1,0 +1,22 @@
+# ecumene — stack de PRODUCCIÓN de la build web (nginx estático con builds/web/).
+# Antes: `tools/export.sh web` (release), que deja la build en builds/web/.
+# Arranque (desde la raíz del repo):
+#   docker compose -p ecumene_prod -f tools/web/docker-compose.prod.yml up -d --build
+#   docker network connect ecumene_prod cloudflared
+# Ingress del tunnel (dashboard Cloudflare): ecumene.dcahomelab.com -> http://ecumene-web-prod:80
+
+services:
+  web:
+    container_name: ecumene-web-prod
+    build:
+      context: ../..                     # raíz del repo, para poder copiar builds/web/
+      dockerfile: tools/web/Dockerfile
+    ports:
+      - "127.0.0.1:8070:80"   # prueba local; el tunnel entra por la red interna
+    networks:
+      - ecumene_prod
+    restart: unless-stopped
+
+networks:
+  ecumene_prod:
+    name: ecumene_prod

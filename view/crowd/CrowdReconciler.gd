@@ -38,7 +38,7 @@ func sync(
 	if crowd.places == null or _layout_signature != layout.signature:
 		_layout_signature = layout.signature.duplicate()
 		crowd.places = Places.from_layout(layout)
-		_rehome_from_plaza(crowd, params)
+		_rehome_from_plaza(crowd)
 
 	var bulk := _sync_population(crowd, node, params, delta)
 	_sync_jobs(crowd, node, params, delta, bulk)
@@ -53,7 +53,9 @@ func sync(
 func _sync_population(
 	crowd: Crowd, node: SimNode, params: CrowdParams, delta: float
 ) -> bool:
-	var visible := mini(int(round(node.pop)), params.max_villagers)
+	# Cuántos puntos toca dibujar lo decide `CrowdParams`: es tuning visual, y de él sale el
+	# `represents` con el que se reparten los oficios más abajo.
+	var visible := params.dots_for(node.pop)
 	crowd.represents = node.pop / float(visible) if visible > 0 else 1.0
 
 	var current := crowd.active_count()
@@ -67,8 +69,10 @@ func _sync_population(
 	if bulk:
 		for _i in maxi(difference, 0):
 			crowd.spawn(params, false)
-		for _i in maxi(-difference, 0):
-			crowd.retire_one()
+		# Y vaciar de golpe es lo simétrico de llenar de golpe: si al llenar nadie entra andando,
+		# al vaciar nadie sale andando. Sacarlos con su desvanecimiento dejaba a los salientes
+		# apilados por encima del tope justo en el fotograma que ya iba cargado.
+		crowd.retire_many(maxi(-difference, 0))
 		_arrival_budget = 0.0
 		return true
 
@@ -87,7 +91,7 @@ func _sync_population(
 
 ## Al construir las primeras cabañas, quien vivía apiñado en la plaza se muda. Sin esto, los
 ## habitantes fundadores se quedarían para siempre amontonados en el centro del mapa.
-func _rehome_from_plaza(crowd: Crowd, params: CrowdParams) -> void:
+func _rehome_from_plaza(crowd: Crowd) -> void:
 	if crowd.places.homes.is_empty():
 		return
 	var plaza := crowd.places.plaza

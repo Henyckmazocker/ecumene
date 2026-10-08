@@ -43,8 +43,9 @@ func _ready() -> void:
 func start(seed_value: int) -> void:
 	state = WorldState.create(seed_value, params)
 	_accumulator = 0.0
+	_catch_up_job = null
 	_running = true
-	events.push("world", 0.0, state.root_id,
+	_push_system("world", 0.0, state.root_id,
 		"Fundas %s" % state.root().name, {"seed": seed_value})
 	state_replaced.emit(state)
 
@@ -53,6 +54,9 @@ func start(seed_value: int) -> void:
 func adopt(new_state: WorldState) -> void:
 	state = new_state
 	_accumulator = 0.0
+	# Adoptar otro estado tira la acreditación a medias: los pasos que quedaban eran de un
+	# mundo que ya no existe (es lo que pasa al ascender).
+	_catch_up_job = null
 	_running = true
 	state_replaced.emit(state)
 
@@ -73,6 +77,11 @@ func is_paused() -> bool:
 func _process(delta: float) -> void:
 	if not _running or state == null or is_paused():
 		return
+	# Mientras se acredita una ausencia, el tiempo no avanza por ningún otro sitio: un tick
+	# online colado entre dos pasos cambiaría el troceado y el resultado dejaría de ser el
+	# de un salto.
+	if _catch_up_job != null:
+		return
 	_accumulator += delta * speed() / params.seconds_per_cycle
 	# Cota anti espiral de la muerte: si el frame se ha ido, no se intenta recuperar todo.
 	var budget := 240
@@ -83,41 +92,132 @@ func _process(delta: float) -> void:
 
 
 ## Avanza la simulación `dt` ciclos. Es el mismo camino que usa el catch-up offline.
-func tick(dt: float, offline: bool = false) -> void:
+func tick(dt: float) -> void:
 	if state == null or dt <= 0.0:
 		return
 	var bonus := Ascension.bonuses(state)
 	var base := _modifiers(bonus)
-	state.cycle += dt
+	# Una vez por tick, no por nodo: el legado no cambia a mitad de tick.
+	var delegated := base.scaled(efficiency_of(params, bonus))
+	# Checkpoint de rutas con el ciclo de **antes** del avance: el caudal se fija para el tramo
+	# que empieza ahora. Sin rutas no hace nada y `routed` sale vacío.
+	var routed := Logistics.prepare(state, params)
 
-	# Orden determinista: nunca se itera el Dictionary de nodos directamente.
+	# El tramo se parte en cada llegada de una expedición: el hijo nace en el ciclo exacto y crece
+	# el resto del tramo, así que tickear de 1 en 1 o de un salto da la misma colonia (regla 4).
+	# Sin expediciones es un solo tramo de `dt`, como siempre. Las decisiones van después, una vez.
+	var target := state.cycle + dt
+	var left := dt
+	while true:
+		var next := state.next_arrival()
+		# El reloj se pone al final del tramo **antes** de avanzarlo, como siempre: lo que se anota
+		# durante el avance (una hambruna) sale con el ciclo en que acaba el tramo.
+		if next > target:
+			state.cycle = target
+			if left > 0.0:
+				_advance_all(left, routed, base, delegated)
+			break
+		var span := next - state.cycle
+		if span > 0.0:
+			state.cycle = next
+			_advance_all(span, routed, base, delegated)
+		left = target - state.cycle
+		for e in state.pop_arrivals(next):
+			Promotion.arrive(state, e, events)
+
+	# El gobernador decide con los mismos multiplicadores con los que se integra su nodo
+	# (`delegated`): si mirase la economía sin legado ni peaje, vería otro techo y otras tasas que
+	# las que de verdad avanzan, y fundaría o construiría a destiempo.
 	for id in state.ordered_ids():
-		var node: SimNode = state.nodes[id]
-		var mods := base
-		if node.is_delegated():
-			var efficiency := minf(params.governor_efficiency + bonus.governor, 1.0)
-			mods = base.scaled(efficiency)
-		Integrator.advance(node, params, dt, mods)
+		GovernorSys.run(state, state.nodes[id], params, events, delegated)
 
-	for id in state.ordered_ids():
-		GovernorSys.run(state, state.nodes[id], params, events)
-
-	_prune(offline)
+	_prune()
 	state.refresh_totals()
 	state.peak_tier = maxi(state.peak_tier, state.max_tier())
 	cycle_advanced.emit(state.cycle)
 
 
+## Un tramo sin llegadas: los nodos con rutas juntos y el resto cada uno con
+## `Integrator.advance`. Es el cuerpo de `tick` de antes de las expediciones, partido para que un
+## hijo pueda nacer entre dos tramos.
+func _advance_all(
+	span: float, routed: PackedInt32Array, base: Integrator.Modifiers, delegated: Integrator.Modifiers
+) -> void:
+	# Los nodos con rutas avanzan juntos, porque una ruta se corta en los dos extremos a la vez
+	# (ver `Logistics`). Cada uno sigue avanzando solo con `Integrator.advance`; lo único que
+	# comparten es el instante del corte.
+	var was_routed_starving := {}
+	if not routed.is_empty():
+		for id in routed:
+			was_routed_starving[id] = (state.nodes[id] as SimNode).starving
+		Logistics.advance_routed(state, params, span, routed, base, delegated)
+
+	# Orden determinista: nunca se itera el Dictionary de nodos directamente.
+	for id in state.ordered_ids():
+		var node: SimNode = state.nodes[id]
+		# El flanco se mira con el valor de antes del avance, guardado aquí y no en el nodo: un
+		# campo nuevo cambiaría el save y el `state_hash` por algo que solo es un aviso.
+		var was_starving: bool = was_routed_starving.get(id, node.starving)
+		if not was_routed_starving.has(id):
+			Integrator.advance(node, params, span, delegated if node.is_delegated() else base)
+		if node.starving and not was_starving and node.is_delegated():
+			_warn_famine(node)
+
+
 ## Informe de la última ausencia acreditada, para la pantalla de vuelta. `null` si no hubo.
 var last_offline: OfflineReport = null
 
+## Acreditación en curso, si la hay. Mientras exista, el tick normal no corre: ver `_process`.
+var _catch_up_job: CatchUpJob = null
 
-## Acredita el tiempo transcurrido con el juego cerrado, en segundos reales.
+
+## Una acreditación de ausencia a medias.
+##
+## Existe para poder acreditar **repartido entre fotogramas** y enseñar una barra en vez de
+## colgar el juego un cuarto de minuto. Lo que la hace inofensiva es que el troceado se decide
+## de una vez en `begin_catch_up` y no vuelve a tocarse: los fotogramas cambian *cuándo* se dan
+## los pasos, nunca *cuáles*, así que acreditar en uno o en cincuenta da el mismo estado bit a
+## bit que el bucle de un tirón. `catchup_test.gd` es el que no deja que eso deje de ser verdad.
+class CatchUpJob extends RefCounted:
+	## Pasos en los que está troceada la ausencia, y ciclos de cada paso.
+	var steps: int = 1
+	var chunk: float = 0.0
+	var done: int = 0
+	## Segundos acreditados (ya recortados por el tope) y ciclos que salen de ellos.
+	var credited: float = 0.0
+	var cycles: float = 0.0
+	var capped: bool = false
+	## Foto del estado antes del primer paso, para el informe de vuelta.
+	var before: Dictionary = {}
+	## Si ya se compuso el informe. Cerrar dos veces la misma ausencia dejaría dos anuncios de
+	## vuelta en el diario, y quien conduce la acreditación puede llamar de más (ver el mínimo
+	## de tiempo que la barra se queda en pantalla).
+	var reported: bool = false
+
+	func progress() -> float:
+		return float(done) / float(maxi(steps, 1))
+
+	func is_done() -> bool:
+		return done >= steps
+
+
+## Acredita el tiempo transcurrido con el juego cerrado, en segundos reales, de un tirón.
 ## Devuelve los ciclos realmente acreditados (ya recortados por el tope).
 func catch_up(elapsed_seconds: float) -> float:
-	if state == null or elapsed_seconds <= 0.0:
+	var job := begin_catch_up(elapsed_seconds)
+	if job == null:
 		return 0.0
-	var before := OfflineReport.snapshot(state)
+	while not advance_catch_up(job, 0.0):
+		pass
+	return job.cycles
+
+
+## Prepara la acreditación de una ausencia y **no da ningún paso**. `null` si no hay nada que
+## acreditar. Aquí se decide el troceado entero; a partir de este punto ya no depende de nada
+## externo, y por eso da igual en cuántos fotogramas se consuma.
+func begin_catch_up(elapsed_seconds: float) -> CatchUpJob:
+	if state == null or elapsed_seconds <= 0.0:
+		return null
 	var bonus := Ascension.bonuses(state)
 	var cap := params.offline_cap_seconds + bonus.offline_cap_seconds
 	var credited := minf(elapsed_seconds, cap)
@@ -131,7 +231,7 @@ func catch_up(elapsed_seconds: float) -> float:
 	var efficiency := minf(params.offline_efficiency + bonus.offline_rate, 1.0)
 	var cycles := credited * efficiency / params.seconds_per_cycle
 	if cycles <= 0.0:
-		return 0.0
+		return null
 
 	# El avance del tiempo se compone; **las decisiones no**. Con un solo salto, un nodo
 	# delegado crecería hasta el techo de los edificios que tenía cuando cerraste el juego y
@@ -139,19 +239,77 @@ func catch_up(elapsed_seconds: float) -> float:
 	# Con nodos delegados se trocea en pasos —acotados a 64, no uno por ciclo— para que
 	# construir y crecer se alternen. Sin delegar no hay decisiones que intercalar y se
 	# resuelve de un salto, que es lo barato.
-	var steps := 1
-	if _has_delegated():
-		steps = clampi(int(cycles / params.governor_interval), 1, CATCHUP_STEPS)
-	var chunk := cycles / float(steps)
-	for _i in steps:
-		tick(chunk, true)
+	#
+	# Con rutas, lo mismo y por otra razón: el caudal se fija en cada checkpoint, y un salto de
+	# 40.000 ciclos con el caudal del primero regalaría o robaría recursos. Cada paso dura al menos
+	# un `governor_interval`, así que cada uno empieza con su checkpoint de rutas.
+	var job := CatchUpJob.new()
+	job.steps = 1
+	if _has_delegated() or not state.routes.is_empty():
+		job.steps = clampi(int(cycles / params.governor_interval), 1, CATCHUP_STEPS)
+	job.chunk = cycles / float(job.steps)
+	job.credited = credited
+	job.cycles = cycles
+	job.capped = elapsed_seconds > cap
+	job.before = OfflineReport.snapshot(state)
+	_catch_up_job = job
+	return job
 
-	last_offline = OfflineReport.build(before, state, params, credited, cycles,
-		elapsed_seconds > cap)
-	events.push("offline", state.cycle, state.root_id,
-		"Vuelves tras %s: %d ciclos acreditados" % [_format_span(credited), int(cycles)],
-		{"seconds": credited, "cycles": cycles, "capped": elapsed_seconds > cap})
-	return cycles
+
+## Da al menos un paso de la acreditación, y todos los que quepan enteros en `budget_msec`
+## (con `0.0`, todos los que queden). Devuelve `true` cuando ya no queda nada.
+##
+## Los pasos se dan **enteros**: partir uno para que cupiera en el presupuesto cambiaría el
+## troceado, y con él el resultado.
+func advance_catch_up(job: CatchUpJob, budget_msec: float = 0.0) -> bool:
+	if job == null or job.reported:
+		return true
+	var deadline := Time.get_ticks_usec() + int(budget_msec * 1000.0)
+	while not job.is_done():
+		tick(job.chunk)
+		job.done += 1
+		if budget_msec > 0.0 and Time.get_ticks_usec() >= deadline:
+			break
+	if not job.is_done():
+		return false
+
+	job.reported = true
+	if _catch_up_job == job:
+		_catch_up_job = null
+	last_offline = OfflineReport.build(job.before, state, params, job.credited, job.cycles,
+		job.capped, governor_efficiency())
+	_push_system("offline", state.cycle, state.root_id,
+		"Vuelves tras %s: %d ciclos acreditados" % [
+			OfflineReport.span(job.credited), int(job.cycles)],
+		{"seconds": job.credited, "cycles": job.cycles, "capped": job.capped})
+	return true
+
+
+## Lo que rinde un nodo delegado, en `[0, 1]`: el rendimiento base de `SimParams` más lo que
+## le suma el legado (🎓 Escuela de gobernadores), con tope en 1.
+##
+## Es **la única fuente** de ese número. La aplica `tick`, la enseña el HUD y la cita el informe
+## de vuelta: antes cada uno leía `params.governor_efficiency` a su modo y la UI decía 85 % cuando
+## se rendía al 93.
+func governor_efficiency() -> float:
+	return efficiency_of(params, Ascension.bonuses(state))
+
+
+## La misma cuenta sin motor, para quien solo tiene el estado a mano (el HUD).
+static func governor_efficiency_for(state_: WorldState, params_: SimParams) -> float:
+	return efficiency_of(params_, Ascension.bonuses(state_))
+
+
+static func efficiency_of(params_: SimParams, bonus: Ascension.Bonuses) -> float:
+	return minf(params_.governor_efficiency + bonus.governor, 1.0)
+
+
+## Multiplicadores con los que se simula un nodo delegado: legado × peaje. La misma cuenta que
+## `tick`, sin motor, para que el gobernador decida sobre lo que de verdad se integra (y para
+## quien lo llame suelto, como los tests que invocan `GovernorSys.run` sin pasar por `tick`).
+static func delegated_modifiers(state_: WorldState, params_: SimParams) -> Integrator.Modifiers:
+	var bonus := Ascension.bonuses(state_)
+	return _modifiers(bonus).scaled(efficiency_of(params_, bonus))
 
 
 ## Multiplicadores en vigor ahora mismo. La UI los usa para que el HUD enseñe exactamente las
@@ -169,7 +327,7 @@ func _has_delegated() -> bool:
 	return false
 
 
-func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
+static func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
 	var mods := Integrator.Modifiers.new()
 	mods.production = bonus.production
 	mods.food = bonus.food
@@ -180,7 +338,7 @@ func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
 
 ## Retira los nodos que han colapsado por hambruna. La raíz nunca se retira: si se vacía,
 ## la partida sigue con lo que queda (reiniciar es decisión del jugador, no del motor).
-func _prune(offline: bool) -> void:
+func _prune() -> void:
 	for id in state.ordered_ids():
 		var node: SimNode = state.nodes.get(id)
 		if node == null or node.id == state.root_id:
@@ -193,14 +351,41 @@ func _prune(offline: bool) -> void:
 			if idx >= 0:
 				parent.children.remove_at(idx)
 		state.nodes.erase(id)
-		if not offline:
-			events.push("collapse", state.cycle, id,
-				"%s se despuebla y desaparece" % node.name, {"tier": node.tier})
+		# Sus rutas se van con él, en el mismo paso: el siguiente checkpoint no puede encontrarse
+		# una ruta con un extremo que ya no existe.
+		Logistics.drop_routes_of(state, id)
+		# Y su expedición en camino, si la tenía: los colonos se pierden. No se adopta en el
+		# abuelo, que no la mandó, y un hijo no puede nacer con un padre que ya no existe.
+		var lost := state.cancel_expedition_of(id)
+		# También durante la acreditación: el log no es estado, así que anotarlo no mueve el
+		# `state_hash`, y sin él nadie podía contar que una colonia murió mientras no estabas
+		# (`Analytics._count_offline` veía siempre cero). El diario no se llena igual:
+		# `Main._on_event` calla mientras dura la barra.
+		var data := {"tier": node.tier}
+		var text := "%s se despuebla y desaparece" % node.name
+		if lost != null:
+			data["expedition_lost"] = lost.pop
+			text += ", y con él la expedición que había mandado"
+		_push_system("collapse", state.cycle, id, text, data)
 
 
-static func _format_span(seconds: float) -> String:
-	var hours := int(seconds) / 3600
-	var minutes := (int(seconds) % 3600) / 60
-	if hours > 0:
-		return "%d h %d min" % [hours, minutes]
-	return "%d min" % minutes
+## Un nodo delegado acaba de **entrar** en hambruna: se anota una vez por episodio, no por ciclo,
+## porque lo que se avisa es el cambio. Solo delegado: el que lleva el jugador ya lo tiene
+## delante en rojo, y aquí lo que se denuncia es al gobernador que lo deja pasar.
+##
+## Sale como `system` y no como `governor`: nadie lo decide, es lo que la simulación constata.
+## No va a Augur (`Analytics._on_event` lo descarta en su `_:`).
+func _warn_famine(node: SimNode) -> void:
+	_push_system("famine", state.cycle, node.id,
+		"⚠️ %s pasa hambre y su gobernador no lo remedia" % node.name, {"tier": node.tier})
+
+
+## Lo que anota el propio motor —fundar el mundo, acreditar una ausencia, un colapso— no lo
+## decide nadie: sale con el actor `system`, y el actor de antes se restaura al acabar.
+func _push_system(
+	category: String, cycle: float, node_id: int, text: String, data: Dictionary
+) -> void:
+	var prev := events.actor
+	events.actor = "system"
+	events.push(category, cycle, node_id, text, data)
+	events.actor = prev

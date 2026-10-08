@@ -91,25 +91,62 @@ class Segment:
 		pinned.resize(Goods.COUNT)
 
 
+## Primer instante, dentro de un `advance`, en que cada stock queda **fijado** a cero o a su tope.
+## INF si no llega a fijarse. Solo lo pide `Logistics` en sus sondas: una ruta no puede seguir
+## sacando de un almacén vacío ni metiendo en uno lleno, y este es el aviso de que va a pasar.
+##
+## Se anota al construir el tramo y no al resolver el evento: lo que importa no es que el stock
+## *toque* el cero, sino que se quede ahí porque la tasa total no le deja salir.
+class Pins:
+	extends RefCounted
+	var empty_at := PackedFloat64Array()
+	var full_at := PackedFloat64Array()
+
+	func _init() -> void:
+		empty_at.resize(Goods.COUNT)
+		empty_at.fill(INF)
+		full_at.resize(Goods.COUNT)
+		full_at.fill(INF)
+
+	func record(node: SimNode, seg: Segment, elapsed: float) -> void:
+		for i in Goods.COUNT:
+			if seg.pinned[i] == 0:
+				continue
+			if node.stocks[i] <= EPS:
+				if empty_at[i] == INF:
+					empty_at[i] = elapsed
+			elif full_at[i] == INF:
+				full_at[i] = elapsed
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 
 ## Avanza el nodo `dt` ciclos. Devuelve el número de segmentos consumidos, útil para los
 ## tests y para detectar dinámicas patológicas.
-static func advance(node: SimNode, params: SimParams, dt: float, mods: Modifiers = null) -> int:
+##
+## `pins`, si se pasa, anota cuándo se fija cada stock (ver `Pins`). No cambia nada de la cuenta:
+## es un testigo, y sin él el camino es el de siempre, bit a bit.
+static func advance(
+	node: SimNode, params: SimParams, dt: float, mods: Modifiers = null, pins: Pins = null
+) -> int:
 	if dt <= EPS:
 		return 0
 	if mods == null:
 		mods = Modifiers.none()
 	var remaining := dt
+	var elapsed := 0.0
 	var segments := 0
 	while remaining > EPS and segments < params.max_segments:
 		segments += 1
 		var seg := build_segment(node, params, mods)
+		if pins != null:
+			pins.record(node, seg, elapsed)
 		var step := _next_event_time(node, seg, remaining, params)
 		_apply(node, seg, step)
 		remaining -= step
+		elapsed += step
 	if remaining > EPS:
 		# Salvaguarda: dinámica que genera eventos sin parar. Se avanza el resto de un tirón;
 		# es menos exacto, pero acotado y nunca cuelga el juego.
@@ -165,6 +202,18 @@ static func build_segment(node: SimNode, params: SimParams, base_mods: Modifiers
 	var food_slope := seg.slope[Goods.FOOD]
 	var food_offset := seg.offset[Goods.FOOD]
 
+	# Rutas: un término constante más, −caudal en el origen y +caudal en el destino (y el 🐎 que
+	# paga el origen). Lo fija `Logistics` en su checkpoint y no depende de `P`, así que el tramo
+	# sigue siendo `a·P + b` y cada nodo sigue avanzando solo. Va **después** de capturar la
+	# comida de los edificios a propósito: lo importado no se suma a `food_offset` tal cual, sino
+	# aparte y con tope (`_food_capacity`). Sin rutas el array está vacío y no se suma ni un cero.
+	var food_imported := 0.0
+	if not node.route_offset.is_empty():
+		for i in Goods.COUNT:
+			seg.offset[i] += node.route_offset[i]
+		# Solo la comida que **entra en neto**: exportar no baja el techo, como antes de M2.
+		food_imported = maxf(node.route_offset[Goods.FOOD], 0.0)
+
 	# El consumo de comida por habitante NO lo escalan los bonos: comer se come igual
 	# offline y con o sin legado. Solo la producción se multiplica.
 	seg.slope[Goods.FOOD] -= params.food_per_pop
@@ -179,7 +228,7 @@ static func build_segment(node: SimNode, params: SimParams, base_mods: Modifiers
 	# integrador ni el jugador pueden leer, y que hace que un salto largo y muchos pasos
 	# cortos den resultados distintos.
 	seg.raw_housing = seg.housing
-	seg.food_capacity = _food_capacity(food_slope, food_offset, params)
+	seg.food_capacity = _food_capacity(food_slope, food_offset, params, food_imported)
 	seg.housing = minf(seg.raw_housing, seg.food_capacity)
 	seg.food_limited = seg.housing < seg.raw_housing - EPS
 
@@ -207,11 +256,22 @@ static func build_segment(node: SimNode, params: SimParams, base_mods: Modifiers
 
 ## A cuánta población da de comer este reparto de trabajo, resolviendo
 ## `producción(P) = consumo(P)`. INF si la producción crece más rápido que las bocas.
-static func _food_capacity(slope: float, offset: float, params: SimParams) -> float:
+##
+## La comida que llega por rutas (`imported`, por ciclo) sube el techo **con tope**: como mucho
+## `food_import_cap` (50 %) del `K` que da el campo propio (decisión 3 del plan de región). Una
+## ciudad puede vivir en parte del campo de otra, pero cortar la ruta la devuelve a su `K` propio
+## con una caída logística, no la extingue. El caudal es constante por tramo, así que este `K`
+## también lo es y la forma cerrada se mantiene. Con el tope, lo importado de más llena el almacén.
+static func _food_capacity(
+	slope: float, offset: float, params: SimParams, imported := 0.0
+) -> float:
 	var margin := params.food_per_pop - slope
 	if margin <= EPS:
 		return INF
-	return maxf(offset / margin, 0.0)
+	var own := maxf(offset / margin, 0.0)
+	if imported <= 0.0:
+		return own
+	return own + minf(imported / margin, params.food_import_cap * own)
 
 
 ## Producción neta de un recurso por trabajador, con los multiplicadores ya aplicados.

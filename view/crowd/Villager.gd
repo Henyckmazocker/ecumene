@@ -219,6 +219,18 @@ func depart(exit_point: Vector2) -> void:
 	target = exit_point
 
 
+## Da media vuelta: vuelve a contar como habitante sin dejar de ser quien era.
+##
+## Conserva casa, oficio y posición —estaba de camino a la salida, no se ha ido—, así que el
+## `fade` sube desde donde estuviera y decide de nuevo en el acto: quien ya iba medio
+## desvanecido reaparece poco a poco en lugar de encenderse de golpe.
+func reinstate() -> void:
+	departing = false
+	activity = Activity.LINGERING
+	target = position
+	decide_in = 0.0
+
+
 func _switch(new_activity: int, new_target: Vector2, params: CrowdParams,
 		rng: RandomNumberGenerator) -> void:
 	activity = new_activity

@@ -1,9 +1,28 @@
-# Datos internos de Godot
+# Datos internos de Godot (incluye export_credentials.cfg, donde Godot guarda las contraseñas
+# de firma: export_presets.cfg sí se sube, no lleva ninguna)
 .godot/
 
-# Builds exportadas
+# Builds exportadas: llevan la clave de Augur de prod dentro del .pck
 build/
+builds/
 export/
 
-# Temporales
+# Clave de Augur: la escribe tools/export.sh justo antes de exportar y la borra al salir
+augur_release.cfg
+*.key
+
+# Firma de Android: el keystore vive en los datos del snap, pero que no se cuele nunca uno aquí
+*.keystore
+*.jks
+
+# El editor es mono: si alguien pulsa «crear script C#», que no entre (el proyecto es GDScript puro)
+.mono/
+*.csproj
+*.sln
+mono_crash.*
+
+# Temporales y basura del sistema
 *.tmp
+*.log
+.DS_Store
+Thumbs.db

@@ -30,8 +30,8 @@ func phase() -> float:
 	return fposmod(elapsed / seconds_per_day, 1.0)
 
 
-## Luz ambiente en [0, 1]: 0 en plena noche, 1 a mediodía. Todavía no se usa para nada — es
-## lo que alimentará el tinte día/noche del CanvasModulate cuando llegue el arte.
+## Luz ambiente en [0, 1]: 0 en plena noche, 1 a mediodía. Alimenta el tinte día/noche del
+## `CanvasModulate` de `SettlementView` (ver `CrowdParams.light_tint`).
 func daylight() -> float:
 	var h := hour()
 	if h < 5.0 or h > 21.0:

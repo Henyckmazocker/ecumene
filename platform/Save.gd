@@ -23,10 +23,15 @@ static func exists() -> bool:
 	return FileAccess.file_exists(PATH)
 
 
-static func write(state: WorldState) -> bool:
+## `view` es lo que la vista quiere recuperar al cargar —hoy, `{"focus": id}`, el nodo enfocado—.
+## Va en el save pero **fuera de `WorldState`**, como `saved_at` y `engine`: no es estado de la
+## simulación y no entra en `state_hash` (mirar a un hijo no cambia la partida).
+static func write(state: WorldState, view := {}) -> bool:
 	var payload := state.to_dict()
 	payload["saved_at"] = Time.get_unix_time_from_system()
 	payload["engine"] = Engine.get_version_info()["string"]
+	if not view.is_empty():
+		payload["view"] = view.duplicate(true)
 
 	# El guardado anterior se conserva: un save corrupto no puede tragarse una partida larga.
 	if FileAccess.file_exists(PATH):
@@ -48,17 +53,18 @@ static func write(state: WorldState) -> bool:
 
 
 ## Carga la partida. Devuelve `null` si no hay ninguna o está corrupta (entonces se intenta
-## el respaldo). `out_elapsed` recibe los segundos reales transcurridos desde el guardado.
-static func read(out_elapsed: Array = []) -> WorldState:
-	var state := _read_from(PATH, out_elapsed)
+## el respaldo). `out_elapsed` recibe los segundos reales transcurridos desde el guardado, y
+## `out_view` lo que se guardó de la vista (`{"focus": id}`), o nada si el save es de antes.
+static func read(out_elapsed: Array = [], out_view: Dictionary = {}) -> WorldState:
+	var state := _read_from(PATH, out_elapsed, out_view)
 	if state == null:
-		state = _read_from(BACKUP, out_elapsed)
+		state = _read_from(BACKUP, out_elapsed, out_view)
 		if state != null:
 			push_warning("Ecumene: save principal ilegible, se ha cargado el respaldo.")
 	return state
 
 
-static func _read_from(path: String, out_elapsed: Array) -> WorldState:
+static func _read_from(path: String, out_elapsed: Array, out_view: Dictionary) -> WorldState:
 	if not FileAccess.file_exists(path):
 		return null
 	var file := FileAccess.open(path, FileAccess.READ)
@@ -76,6 +82,9 @@ static func _read_from(path: String, out_elapsed: Array) -> WorldState:
 	if saved_at > 0.0:
 		elapsed = maxf(Time.get_unix_time_from_system() - saved_at, 0.0)
 	out_elapsed.append(elapsed)
+	var view = data.get("view", {})
+	if typeof(view) == TYPE_DICTIONARY:
+		out_view.merge(view, true)
 	return WorldState.from_dict(data)
 
 
@@ -102,6 +111,14 @@ static func migrate(data: Dictionary) -> Dictionary:
 			1:
 				_migrate_1_to_2(data)
 				version = 2
+			2:
+				# v2 → v3: las rutas son nuevas y `WorldState.from_dict` las toma vacías por
+				# defecto. No hay nada que reescribir.
+				version = 3
+			3:
+				# v3 → v4: las expediciones son nuevas y `WorldState.from_dict` las toma vacías.
+				# Un save de antes carga sin ninguna en camino, que es lo que tenía.
+				version = 4
 			_:
 				push_warning("Ecumene: sin migración desde el esquema %d." % version)
 				return {}

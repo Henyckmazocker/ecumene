@@ -11,9 +11,15 @@ config_version=5
 [application]
 
 config/name="Ecumene"
+config/version="0.4.0"
 run/main_scene="res://main/Main.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
 config/icon="res://icon.svg"
+
+[autoload]
+
+Augur="*res://addons/augur/augur.gd"
+Analytics="*res://platform/Analytics.gd"
 
 [display]
 
@@ -26,6 +32,10 @@ window/handheld/orientation=1
 [dotnet]
 
 project/assembly_name="Ecumene"
+
+[gui]
+
+theme/custom="res://assets/ProjectTheme.tres"
 
 [rendering]
 

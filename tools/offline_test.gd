@@ -24,6 +24,24 @@ func _init() -> void:
 	failures += _delegated_grows_while_away()
 	failures += _the_return_is_reported()
 	failures += _upgrades_do_not_break_the_closed_form()
+	# Rutas (M1): saltos de un checkpoint frente a ciclo a ciclo, y que no creen ni tiren nada.
+	failures += _route_jumps_match_steps("ruta de comida", TestUtil.make_routed_engine.bind(4242))
+	failures += _route_jumps_match_steps("ruta que vacía el origen",
+		_wood_route.bind(5.0, 0.0))
+	failures += _route_conserves("el origen se vacía", 5.0, 0.0, 5.0)
+	failures += _route_conserves("el destino se llena", 100.0, -3.0, 3.0)
+	failures += _pruned_node_drops_its_routes()
+	# Región (M2): la comida importada sube el `K` del destino con tope, y cortar la ruta lo
+	# devuelve a su `K` propio sin extinguirlo, también de un salto largo.
+	failures += _imported_food_raises_k()
+	failures += _cut_route_falls_to_own_k()
+	# Expediciones (M1): el hijo nace a mitad del tramo y crece lo mismo de 1 en 1 que de un salto.
+	failures += _expedition_jumps_match_steps("llegada en ciclo entero", 0.0)
+	failures += _expedition_jumps_match_steps("llegada a mitad de ciclo", 0.3)
+	# ⏩ Acelerar con oro (M3 del sumidero): adelantar la llegada no rompe N×1 == N, y lo que el
+	# recorte deja en el pasado llega en el siguiente tick.
+	failures += _accelerated_jumps_match_steps()
+	failures += _accelerated_to_now_arrives_next_tick()
 
 	TestUtil.finish(self, failures)
 
@@ -227,3 +245,399 @@ func _cap_and_efficiency() -> int:
 		]
 	)
 	return failures
+
+
+## **M1, criterio 2.** Con rutas, un salto por checkpoint (`tick(governor_interval)`) frente a
+## `tick(1)`: mismo error relativo que `_compare`. El hash no se pide igual, porque la forma
+## cerrada y el paso a paso no coinciden en el último bit ni sin rutas.
+##
+## No se compara contra un único salto largo: el caudal se fija en cada checkpoint, así que entre
+## dos checkpoints es donde la ruta es una constante y el salto tiene que ser exacto.
+func _route_jumps_match_steps(label: String, make: Callable) -> int:
+	var measured := _jump_vs_step(make, true)
+	# El mismo escenario sin la ruta, como vara de medir: el error que se acepta es el que ya hay.
+	var baseline := _jump_vs_step(make, false)
+	var worst: float = measured[0]
+	return TestUtil.check(
+		worst <= TOLERANCE and bool(measured[2]),
+		"%s: 100 checkpoints de un salto == ciclo a ciclo, error máx. %s en %s (sin la ruta, %s)" % [
+			label, TestUtil.sci(worst), measured[1], TestUtil.sci(baseline[0]),
+		],
+		"%s: saltar de checkpoint en checkpoint no da lo mismo que ciclo a ciclo: error %s en %s" % [
+			label, TestUtil.sci(worst), measured[1],
+		]
+	)
+
+
+## `[error máximo, dónde, mismos nodos]` entre `tick(1)` y `tick(governor_interval)` a lo largo de
+## 100 checkpoints. Con `keep_route = false` se borra la ruta antes de empezar.
+func _jump_vs_step(make: Callable, keep_route: bool) -> Array:
+	var stepwise: SimEngine = make.call()
+	var jump: SimEngine = make.call()
+	if not keep_route:
+		for engine in [stepwise, jump]:
+			var r: Route = engine.state.routes[0]
+			Logistics.set_route(engine.state, r.from_id, r.to_id, r.good, 0.0)
+	var interval := stepwise.params.governor_interval
+	var checkpoints := 100
+	for _i in int(interval) * checkpoints:
+		stepwise.tick(1.0)
+	for _i in checkpoints:
+		jump.tick(interval)
+
+	var worst := 0.0
+	var worst_name := "nada"
+	for id in stepwise.state.ordered_ids():
+		var a: SimNode = stepwise.state.nodes[id]
+		var b: SimNode = jump.state.nodes.get(id)
+		if b == null:
+			return [INF, "el nodo %d, que solo existe paso a paso" % id, false]
+		var err := TestUtil.rel_error(a.pop, b.pop)
+		if err > worst:
+			worst = err
+			worst_name = "población de %d" % id
+		for i in Goods.COUNT:
+			err = TestUtil.rel_error(a.stocks[i], b.stocks[i])
+			if err > worst:
+				worst = err
+				worst_name = "%s de %d" % [Goods.NAMES[i], id]
+	return [worst, worst_name, stepwise.state.nodes.size() == jump.state.nodes.size()]
+
+
+## **Lo que decide si el spike pasa:** una ruta no crea ni destruye nada. Si el origen se vacía a
+## mitad de tramo, el destino deja de recibir en el mismo instante; si el destino se llena, el
+## origen deja de pagar. Con madera, que nadie produce ni consume aquí, lo que hay entre los dos
+## nodos tiene que ser lo mismo antes y después, y lo movido, exactamente `expected`.
+##
+## Sin el corte, el primer caso entregaba 15 de madera habiendo salido 5 del origen.
+func _route_conserves(label: String, origin: float, dest_room: float, expected: float) -> int:
+	var failures := 0
+	for mode in ["paso a paso", "de un salto"]:
+		var engine := _wood_route(origin, dest_room)
+		var state := engine.state
+		var root := state.root()
+		var child: SimNode = state.nodes[root.children[0]]
+		var dest_before := child.stocks[Goods.WOOD]
+		var total_before := root.stocks[Goods.WOOD] + dest_before
+		if mode == "paso a paso":
+			for _i in 30:
+				engine.tick(1.0)
+		else:
+			engine.tick(30.0)
+		var moved := child.stocks[Goods.WOOD] - dest_before
+		var total_after := root.stocks[Goods.WOOD] + child.stocks[Goods.WOOD]
+		failures += TestUtil.check(
+			TestUtil.rel_error(total_before, total_after) <= 1.0e-9
+				and absf(moved - expected) <= 1.0e-9 and state.routes[0].flow == 0.0,
+			"%s (%s): la ruta mueve %.6f de madera y se corta; total %.6f → %.6f" % [
+				label, mode, moved, total_before, total_after,
+			],
+			"%s (%s): la ruta no conserva: movido %.9f (se esperaba %.1f), total %.9f → %.9f, caudal %.2f" % [
+				label, mode, moved, expected, total_before, total_after, state.routes[0].flow,
+			]
+		)
+	return failures
+
+
+## Pueblo y colonia sin leñadores, con una ruta de madera de 0,5/ciclo del pueblo a la colonia. El
+## pueblo empieza con `origin` de madera y la colonia a `dest_room` de su tope (o vacía con 0).
+func _wood_route(origin: float, dest_room: float) -> SimEngine:
+	var engine := TestUtil.make_routed_engine(5150, Goods.WOOD, 0.5)
+	var state := engine.state
+	var root := state.root()
+	var child: SimNode = state.nodes[root.children[0]]
+	var woodcutter := Content.building_index("woodcutter")
+	root.jobs[woodcutter] = 0.0
+	child.jobs[woodcutter] = 0.0
+	root.stocks[Goods.WOOD] = origin
+	var cap := child.storage_caps(engine.params)[Goods.WOOD]
+	child.stocks[Goods.WOOD] = cap + dest_room if dest_room < 0.0 else 0.0
+	return engine
+
+
+## Una colonia que se despuebla se poda, y sus rutas se van con ella **en el mismo tick**: el
+## siguiente checkpoint no puede encontrarse una ruta con un extremo que ya no existe.
+func _pruned_node_drops_its_routes() -> int:
+	var engine := TestUtil.make_routed_engine(4243)
+	var state := engine.state
+	var child_id: int = state.root().children[0]
+	(state.nodes[child_id] as SimNode).pop = 0.0
+	engine.tick(1.0)
+	return TestUtil.check(
+		not state.nodes.has(child_id) and state.routes.is_empty()
+			and state.root().route_offset.is_empty(),
+		"podar una colonia borra sus rutas en el mismo tick, y el padre deja de pagarlas",
+		"podar una colonia deja %d rutas colgando (colonia %s)" % [
+			state.routes.size(), "viva" if state.nodes.has(child_id) else "podada",
+		]
+	)
+
+
+## Una región que alimenta a una ciudad: el campo de la ciudad da de comer a 36 (15 granjeros ×
+## 0,6 / 0,25) y la región le manda `rate` 🌾/ciclo. La región tiene comida y 🐎 de sobra en el
+## almacén, para que lo único que se mida sea el destino.
+func _fed_city(rate: float) -> SimEngine:
+	var engine := TestUtil.make_engine(6060)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.REGION
+	root.stocks[Goods.FOOD] = 5.0e4
+	root.stocks[Goods.TRANSPORT] = 5.0e4
+	state.refresh_totals()
+	root.pop = 500.0
+	var child := TestUtil.found_now(state, root, engine.params)
+	root.pop = 5.0
+	var farm := Content.building_index("farm")
+	child.buildings[farm] = 5
+	child.jobs[farm] = 15.0
+	child.buildings[Content.building_index("hut")] = 20  # alojamiento de 110: manda la comida
+	child.pop = 36.0
+	state.refresh_totals()
+	Logistics.set_route(state, root.id, child.id, Goods.FOOD, rate)
+	return engine
+
+
+## Lo importado se suma al `K` como `caudal / consumo por habitante`, hasta el 50 % del propio.
+func _imported_food_raises_k() -> int:
+	var failures := 0
+	var cap := SimParams.new().food_import_cap
+	for case in [[0.0, 36.0], [4.0, 52.0], [20.0, 36.0 * (1.0 + cap)]]:
+		var engine := _fed_city(case[0])
+		var child: SimNode = engine.state.nodes[engine.state.root().children[0]]
+		var k := Integrator.snapshot(child, engine.params).food_capacity
+		failures += TestUtil.check(
+			absf(k - float(case[1])) <= 1.0e-9,
+			"con %.0f 🌾/ciclo importados el techo por comida es %.2f (propio 36)" % [case[0], k],
+			"con %.0f 🌾/ciclo importados el techo es %.6f y se esperaba %.2f" % [
+				case[0], k, case[1],
+			]
+		)
+	return failures
+
+
+## **Hecho cuando de M2.** La ciudad crece con la ruta por encima de su campo; al cortarla baja a
+## su `K` propio con la logística descendente, sin extinguirse. Paso a paso y de un salto dan lo
+## mismo, y un salto offline de 40.000 ciclos la deja en 36, no en cero.
+func _cut_route_falls_to_own_k() -> int:
+	var stepwise := _fed_city(4.0)
+	var jump := _fed_city(4.0)
+	for engine in [stepwise, jump]:
+		for _i in 40:
+			engine.tick(30.0)
+	var fed: float = (stepwise.state.nodes[stepwise.state.root().children[0]] as SimNode).pop
+	for engine in [stepwise, jump]:
+		var root: SimNode = engine.state.root()
+		Logistics.set_route(engine.state, root.id, root.children[0], Goods.FOOD, 0.0)
+	var cut_k := Integrator.snapshot(
+		stepwise.state.nodes[stepwise.state.root().children[0]], stepwise.params).food_capacity
+	for _i in 3000:
+		stepwise.tick(1.0)
+	jump.tick(3000.0)
+	var a: SimNode = stepwise.state.nodes[stepwise.state.root().children[0]]
+	var b: SimNode = jump.state.nodes[jump.state.root().children[0]]
+	var err := TestUtil.rel_error(a.pop, b.pop)
+	var failures := TestUtil.check(
+		fed > 50.0 and absf(cut_k - 36.0) <= 1.0e-9 and absf(a.pop - 36.0) <= 1.0e-3
+			and err <= TOLERANCE,
+		"con la ruta la ciudad llega a %.2f hab; cortada, su techo vuelve a %.0f y baja a %.4f (de un salto, %.4f; error %s)" % [
+			fed, cut_k, a.pop, b.pop, TestUtil.sci(err),
+		],
+		"cortar la ruta no devuelve la ciudad a su K propio: con ruta %.2f, K %.3f, paso a paso %.6f, de un salto %.6f" % [
+			fed, cut_k, a.pop, b.pop,
+		]
+	)
+	# Un día fuera de golpe tras el corte: la caída logística se detiene en el K propio.
+	var away := _fed_city(4.0)
+	for _i in 40:
+		away.tick(30.0)
+	var away_root: SimNode = away.state.root()
+	Logistics.set_route(away.state, away_root.id, away_root.children[0], Goods.FOOD, 0.0)
+	away.tick(40000.0)
+	var c: SimNode = away.state.nodes.get(away_root.children[0])
+	failures += TestUtil.check(
+		c != null and absf(c.pop - 36.0) <= 1.0e-6,
+		"un salto offline de 40.000 ciclos tras el corte la deja en %.6f hab, no en cero" % [
+			c.pop if c != null else -1.0,
+		],
+		"tras el corte y un salto largo la ciudad no está en su K propio: %s" % [
+			"podada" if c == null else "%.6f hab" % c.pop,
+		]
+	)
+	return failures
+
+
+## **Una expedición llega igual tickeando de 1 en 1 que de un salto.** `SimEngine.tick` parte el
+## tramo en el ciclo de llegada, así que el hijo nace en el mismo instante y crece el mismo resto
+## del tramo avance como avance el reloj: 2.450 × `tick(1)`, un `tick(2450)` y 64 pasos como los
+## del catch-up. Con `offset` la salida, y con ella la llegada, cae a mitad de ciclo y el corte
+## parte un `tick(1)`. Sin gobernador: las decisiones no se componen (ver `catchup_test`).
+func _expedition_jumps_match_steps(label: String, offset: float) -> int:
+	# 50 ciclos después de la llegada: la colonia todavía está lejos de su techo y cualquier ciclo
+	# de más o de menos se nota en su población y en sus stocks.
+	const CYCLES := 2450
+	var engines: Array[SimEngine] = []
+	var child_id := -1
+	for _i in 3:
+		var engine := TestUtil.make_engine(4343)
+		var root := engine.state.root()
+		root.tier = Content.TOWN
+		root.buildings[Content.building_index("hut")] = 20
+		root.buildings[Content.building_index("farm")] = 8
+		root.pop = 60.0
+		for i in Goods.COUNT:
+			root.stocks[i] = 400.0
+		engine.state.refresh_totals()
+		if offset > 0.0:
+			engine.tick(offset)
+		# El hijo será el siguiente id: sin gobernador no nace ningún otro nodo.
+		child_id = engine.state.next_id
+		Promotion.launch_expedition(engine.state, root, engine.params, null)
+		engines.append(engine)
+	var stepwise := engines[0]
+	var jump := engines[1]
+	var chunked := engines[2]
+	for _i in CYCLES:
+		stepwise.tick(1.0)
+	jump.tick(float(CYCLES))
+	for _i in 64:
+		chunked.tick(float(CYCLES) / 64.0)
+
+	var a: SimNode = stepwise.state.nodes.get(child_id)
+	var failures := 0
+	for pair in [[jump, "de un salto"], [chunked, "en 64 pasos"]]:
+		var other: SimEngine = pair[0]
+		var b: SimNode = other.state.nodes.get(child_id)
+		if a == null or b == null:
+			failures += TestUtil.check(false, "",
+				"%s: el hijo no ha llegado (%s 1 en 1, %s %s)" % [
+					label, a != null, b != null, pair[1],
+				])
+			continue
+		var worst := TestUtil.rel_error(a.pop, b.pop)
+		for i in Goods.COUNT:
+			worst = maxf(worst, TestUtil.rel_error(a.stocks[i], b.stocks[i]))
+			worst = maxf(worst, TestUtil.rel_error(
+				stepwise.state.root().stocks[i], other.state.root().stocks[i]))
+		worst = maxf(worst, TestUtil.rel_error(stepwise.state.root().pop, other.state.root().pop))
+		failures += TestUtil.check(
+			worst <= TOLERANCE and other.state.expeditions.is_empty(),
+			"expedición, %s: el hijo nace igual de 1 en 1 que %s, error máx. %s · pob %.4f" % [
+				label, pair[1], TestUtil.sci(worst), b.pop,
+			],
+			"expedición, %s: de 1 en 1 y %s difieren, error %s (pob %.6f vs %.6f)" % [
+				label, pair[1], TestUtil.sci(worst), a.pop, b.pop,
+			]
+		)
+	return failures
+
+
+## Una ciudad sin gobernador con una expedición en camino (16.800 ciclos: 2.400 × el reloj ×7 de
+## Ciudad, sin hijos). Sin gobernador, como `_expedition_jumps_match_steps`: las decisiones no se
+## componen. El oro justo para la aceleración se pone a mano, que el test es del reloj y no de la
+## economía.
+func _accelerating_city(fraction: float = -1.0) -> SimEngine:
+	var engine := TestUtil.make_engine(4444)
+	if fraction >= 0.0:
+		engine.params.accelerate_fraction = fraction
+	var root := engine.state.root()
+	root.tier = Content.CITY
+	root.buildings[Content.building_index("hut")] = 20
+	root.buildings[Content.building_index("farm")] = 8
+	root.pop = 60.0
+	for i in Goods.COUNT:
+		root.stocks[i] = 400.0
+	engine.state.refresh_totals()
+	Promotion.launch_expedition(engine.state, root, engine.params, null)
+	return engine
+
+
+func _pay_and_accelerate(engine: SimEngine) -> bool:
+	var root := engine.state.root()
+	root.stocks[Goods.GOLD] = Promotion.accelerate_cost(engine.state, root, engine.params)
+	return Promotion.accelerate_expedition(engine.state, root, engine.params, null)
+
+
+## **Acelerar y luego avanzar N×1 da lo mismo que acelerar y avanzar N de golpe.** Acelerar es una
+## acción discreta entre ticks: mueve `arrive_cycle` y `SimEngine.tick` ya parte el tramo en la
+## llegada nueva. Se acelera dos veces a mitad de viaje (ciclo 8.001: quedan 8.799 → 6.599,25 →
+## 4.949,4375), así que la llegada cae a mitad de ciclo y el corte parte un `tick(1)`; luego 1 en 1,
+## de un salto y en 64 pasos hasta 50 ciclos después de la llegada.
+func _accelerated_jumps_match_steps() -> int:
+	const PREFIX := 8001.0
+	var engines: Array[SimEngine] = []
+	var child_id := -1
+	var arrive := 0.0
+	var failures := 0
+	for _i in 3:
+		var engine := _accelerating_city()
+		engine.tick(PREFIX)
+		child_id = engine.state.next_id
+		var ok := _pay_and_accelerate(engine) and _pay_and_accelerate(engine)
+		var e := engine.state.expedition_of(engine.state.root().id)
+		if not ok or e == null or e.accelerations != 2:
+			return TestUtil.check(false, "", "⏩ no se ha podido acelerar dos veces la expedición")
+		arrive = e.arrive_cycle
+		engines.append(engine)
+	failures += TestUtil.check(
+		is_equal_approx(arrive, PREFIX + (16800.0 - PREFIX) * 0.75 * 0.75),
+		"⏩ dos aceleraciones recortan un 25 %% cada una: llega en el ciclo %.4f" % arrive,
+		"⏩ la llegada acelerada está en %.4f, no en %.4f" % [
+			arrive, PREFIX + (16800.0 - PREFIX) * 0.5625,
+		]
+	)
+	var cycles := int(ceil(arrive - PREFIX)) + 50
+	var stepwise := engines[0]
+	var jump := engines[1]
+	var chunked := engines[2]
+	for _i in cycles:
+		stepwise.tick(1.0)
+	jump.tick(float(cycles))
+	for _i in 64:
+		chunked.tick(float(cycles) / 64.0)
+
+	var a: SimNode = stepwise.state.nodes.get(child_id)
+	for pair in [[jump, "de un salto"], [chunked, "en 64 pasos"]]:
+		var other: SimEngine = pair[0]
+		var b: SimNode = other.state.nodes.get(child_id)
+		if a == null or b == null:
+			failures += TestUtil.check(false, "",
+				"⏩ acelerada: el hijo no ha llegado (%s 1 en 1, %s %s)" % [
+					a != null, b != null, pair[1],
+				])
+			continue
+		var worst := TestUtil.rel_error(a.pop, b.pop)
+		for i in Goods.COUNT:
+			worst = maxf(worst, TestUtil.rel_error(a.stocks[i], b.stocks[i]))
+			worst = maxf(worst, TestUtil.rel_error(
+				stepwise.state.root().stocks[i], other.state.root().stocks[i]))
+		worst = maxf(worst, TestUtil.rel_error(stepwise.state.root().pop, other.state.root().pop))
+		failures += TestUtil.check(
+			worst <= TOLERANCE and other.state.expeditions.is_empty(),
+			"⏩ acelerar y avanzar %d ciclos: 1 en 1 == %s, error máx. %s · pob %.4f" % [
+				cycles, pair[1], TestUtil.sci(worst), b.pop,
+			],
+			"⏩ acelerada: de 1 en 1 y %s difieren, error %s (pob %.6f vs %.6f)" % [
+				pair[1], TestUtil.sci(worst), a.pop, b.pop,
+			]
+		)
+	return failures
+
+
+## **Acelerar con la llegada en el mismo ciclo.** Con un recorte del 100 % la llegada caería justo
+## ahora: se acota a `state.cycle`, sigue en camino (no se pierde en el pasado) y el siguiente
+## `tick(1)` la recoge con `pop_arrivals`, en ese ciclo exacto.
+func _accelerated_to_now_arrives_next_tick() -> int:
+	var engine := _accelerating_city(1.0)
+	engine.tick(1000.5)
+	var child_id := engine.state.next_id
+	var ok := _pay_and_accelerate(engine)
+	var e := engine.state.expedition_of(engine.state.root().id)
+	var waiting := ok and e != null and e.arrive_cycle == engine.state.cycle
+	engine.tick(1.0)
+	return TestUtil.check(
+		waiting and engine.state.nodes.has(child_id) and engine.state.expeditions.is_empty(),
+		"⏩ acelerar hasta ahora la deja en el ciclo de hoy y llega en el siguiente tick",
+		"⏩ acelerar hasta ahora: acelerada %s, en camino %s, hijo %s" % [
+			ok, waiting, engine.state.nodes.has(child_id),
+		]
+	)

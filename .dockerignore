@@ -1,0 +1,6 @@
+# Solo tools/web/Dockerfile construye desde la raíz, y solo necesita la build web y su config.
+# Se excluye todo y se deja pasar lo justo: si no, el contexto subiría el repo entero (.godot/,
+# assets, el resto de builds/...). Ojo: excluir builds/ sin la excepción rompe el COPY.
+*
+!builds/web/
+!tools/web/

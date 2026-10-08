@@ -46,6 +46,10 @@ var governor_last_cycle: float = 0.0
 
 ## Caché recalculada tras cada tick — nunca se serializa, se deriva.
 var total_pop: float = 0.0
+## Suma de los caudales de las rutas que tocan este nodo (− lo que sale, + lo que entra), por
+## recurso. La fija `Logistics` y **no se guarda**: se deriva de `WorldState.routes`. Vacío si el
+## nodo no tiene rutas, y entonces el integrador ni lo mira.
+var route_offset := PackedFloat64Array()
 
 ## Efectos de las mejoras, cacheados. `housing()`, `storage_caps()` y `capacity_of()` se
 ## llaman en bucles calientes del HUD y del integrador, así que no se recalculan cada vez.
@@ -115,7 +119,11 @@ func housing(params: SimParams) -> float:
 
 ## Tope de almacenamiento por recurso (INF para los recursos acumulativos).
 func storage_caps(params: SimParams) -> PackedFloat64Array:
-	var multiplier := effects().storage
+	# El tope sube con la escala. Es lo que impide que la economía se estrangule sola: los
+	# costes crecen en progresión geométrica y el tope, sumando almacenes, solo linealmente
+	# (ver `SimParams.storage_per_tier`). Multiplica el tope entero —base y almacenes—, no solo
+	# la base, o subir de escala apenas se notaría.
+	var multiplier := effects().storage * pow(params.storage_per_tier, float(tier))
 	var caps := Goods.zeros()
 	for i in Goods.COUNT:
 		caps[i] = INF if i in Goods.UNCAPPED else params.base_storage * multiplier
@@ -147,6 +155,7 @@ func duplicate_node() -> SimNode:
 	n.governor = governor.duplicate_governor() if governor != null else null
 	n.governor_last_cycle = governor_last_cycle
 	n.total_pop = total_pop
+	n.route_offset = route_offset.duplicate()
 	return n
 
 
@@ -195,4 +204,9 @@ static func from_dict(d: Dictionary) -> SimNode:
 		n.buildings.resize(count)
 	if n.jobs.size() != count:
 		n.jobs.resize(count)
+	# Y el de recursos: un save de antes del transporte trae seis stocks. Los recursos nuevos van
+	# siempre al final de `Goods`, así que rellenar con ceros no mueve ningún índice y el estado
+	# que había queda bit a bit; no hace falta subir el esquema (ver `save_test`).
+	if n.stocks.size() < Goods.COUNT:
+		n.stocks.resize(Goods.COUNT)
 	return n

@@ -1,0 +1,243 @@
+{
+  "_comment": "Catálogo de eventos de Ecúmene y contexto para Claude que sube tools/augur-setup.sh (Plan «Integración con Augur», M5). Cada evento va a `catalog.upsert` tal cual ({name, description, properties}); `catalog.upsert` REEMPLAZA el evento entero, y el script no borra los que ya no estén aquí. Fuente: el «Contrato de eventos» del plan (con la enmienda de M4) y platform/Analytics.gd. Descripciones de hasta 255 caracteres.",
+  "claude_context": "Ecúmene es un juego incremental/idle de gestión a escalas anidadas (Godot): asentamiento (tier 0) → pueblo (1) → ciudad (2) → región (3) → país (4) → imperio (5) → planeta (6). Cada nodo es una instancia de una escala y los de escala alta tienen hijos de la anterior. El tiempo de juego va en ciclos (`cycle`), que se REINICIAN en cada era: ascender (`ascension`) crea un mundo nuevo y sube `era`. Nunca mezcles ciclos de eras distintas: compara por `era` o filtra la primera.\n\nUna sesión de Augur es un arranque del juego, no una partida: la partida sigue entre sesiones (save) y una sesión puede abarcar varias eras. El `n` de las gráficas cuenta sesiones, no eventos.\n\nActores (`actor`): `player` (lo hizo el jugador a mano), `governor` (lo hizo la IA de un nodo delegado) o `system` (el mundo: colapsos). Delegar un nodo (`delegation`) cede su gestión al gobernador, que reparte gente, construye, investiga, promociona y funda según unos pesos (`w_food`, `w_growth`, `w_industry`, `w_expansion`) y permisos (`may_*`) que elige el jugador (`governor_policy`). `governor_decision` es una decisión del gobernador en un checkpoint en el que actuó, con lo que construyó, el segundo candidato y sus puntuaciones, y el cuello de botella del nodo (`limit`: food | housing | none).\n\n`node_sample` es una foto de cada nodo cada 300 ciclos (población, techo `cap`, ociosos, llenado de almacenes, reparto `jobs_<edificio>`). `cap_use` = pop/cap e `idle_share` = ociosos/pop ya vienen calculados; `food_cap = -1` significa que la comida no limita. `depth` es la distancia a la raíz (0 = el nodo de más escala). `offline_return` resume una ausencia (el juego acredita el tiempo fuera de golpe): durante ella no se manda nada suelto.\n\n`channel`: `dev` (pruebas con la clave del entorno), `release` (builds públicas) o `debug` (exports de depuración, a descartar). Hoy solo hay datos `dev` de pruebas automáticas.\n\nPreguntas que buscamos: el RITMO real de la era (en qué ciclo se promociona a cada escala, qué limita a la raíz, cuánto legado da ascender); cuánto DELEGA el jugador y en qué escalas; y cómo se COMPORTA el gobernador (qué construye y qué descarta, si deja más ociosos o llena menos el techo que el jugador a mano, cuánto expande) para afinar su IA. Los valores de balance son provisionales.",
+  "events": [
+    {
+      "name": "game_start",
+      "description": "Arranque con la sesión abierta (una vez por sesión, al aceptar o con el consentimiento ya dado). loaded = venía de un save.",
+      "properties": {
+        "loaded": {"type": "bool", "description": "La partida venía de un save"},
+        "era": {"type": "number", "description": "Era en curso (sube al ascender)"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "nodes": {"type": "number", "description": "Nodos vivos"},
+        "tier_max": {"type": "number", "description": "Escala más alta alcanzada (0 asentamiento … 6 planeta)"},
+        "delegated_nodes": {"type": "number", "description": "Nodos delegados al gobernador"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "build",
+      "description": "Se construye un edificio en un nodo, a mano (player) o por el gobernador (governor).",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id estable del nodo"},
+        "tier": {"type": "number", "description": "Escala del nodo (0 asentamiento … 6 planeta)"},
+        "building": {"type": "string", "description": "Id del edificio (hut, farm, woodcutter, storehouse, quarry, workshop, commons, depot, market, temple)"},
+        "owned": {"type": "number", "description": "Cuántos de ese edificio hay en el nodo tras construir"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "upgrade",
+      "description": "Se compra una mejora (investigación) en un nodo.",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id estable del nodo"},
+        "tier": {"type": "number", "description": "Escala del nodo"},
+        "upgrade": {"type": "string", "description": "Id de la mejora"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "promotion",
+      "description": "Un nodo sube de escala (asentamiento → pueblo …). tier es la escala NUEVA.",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id estable del nodo"},
+        "tier": {"type": "number", "description": "Escala nueva tras promocionar"},
+        "subtree_pop": {"type": "number", "description": "Población del subárbol al promocionar"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "found",
+      "description": "Se funda un nodo hijo (colonia) bajo otro. node_id es el hijo.",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id del hijo fundado"},
+        "parent_id": {"type": "number", "description": "Id del nodo padre"},
+        "tier": {"type": "number", "description": "Escala del hijo"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "collapse",
+      "description": "Un nodo se hunde (se queda sin gente) y desaparece. Lo dispara el mundo (actor = system).",
+      "properties": {
+        "actor": {"type": "string", "description": "system"},
+        "node_id": {"type": "number", "description": "Id del nodo que colapsa"},
+        "tier": {"type": "number", "description": "Escala del nodo"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "ascension",
+      "description": "El jugador asciende: cierra la era y empieza otra en un mundo nuevo. era es la NUEVA; cycle, el ciclo final de la era que se deja.",
+      "properties": {
+        "actor": {"type": "string", "description": "player"},
+        "era": {"type": "number", "description": "Era nueva"},
+        "gained": {"type": "number", "description": "Legado ganado al ascender"},
+        "peak_tier": {"type": "number", "description": "Escala más alta alcanzada en la era que se deja"},
+        "peak_pop": {"type": "number", "description": "Pico de población de la era que se deja (state.peak_pop)"},
+        "cycle": {"type": "number", "description": "Ciclo final de la era que se deja"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "legacy",
+      "description": "Se compra un nodo del árbol de legado (entre eras).",
+      "properties": {
+        "actor": {"type": "string", "description": "player"},
+        "id": {"type": "string", "description": "Id de la mejora de legado"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "delegation",
+      "description": "El jugador delega un nodo al gobernador (delegated = true) o se lo quita (false).",
+      "properties": {
+        "actor": {"type": "string", "description": "player"},
+        "node_id": {"type": "number", "description": "Id del nodo"},
+        "tier": {"type": "number", "description": "Escala del nodo"},
+        "delegated": {"type": "bool", "description": "true al delegar, false al retomar el mando"},
+        "pop": {"type": "number", "description": "Población del nodo en ese momento"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "governor_policy",
+      "description": "Política del gobernador en la que se queda el jugador (coalescida: 2 s reales sin cambios). Pesos normalizados y permisos.",
+      "properties": {
+        "actor": {"type": "string", "description": "player"},
+        "node_id": {"type": "number", "description": "Id del nodo"},
+        "w_food": {"type": "number", "description": "Peso de comida (normalizado, los cuatro suman 1)"},
+        "w_growth": {"type": "number", "description": "Peso de crecimiento"},
+        "w_industry": {"type": "number", "description": "Peso de industria"},
+        "w_expansion": {"type": "number", "description": "Peso de expansión"},
+        "may_build": {"type": "bool", "description": "Puede construir"},
+        "may_research": {"type": "bool", "description": "Puede investigar"},
+        "may_promote": {"type": "bool", "description": "Puede promocionar"},
+        "may_expand": {"type": "bool", "description": "Puede fundar hijos"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "speed",
+      "description": "El jugador cambia la velocidad del reloj (índice del selector).",
+      "properties": {
+        "actor": {"type": "string", "description": "player"},
+        "index": {"type": "number", "description": "Índice de velocidad del HUD"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "governor_decision",
+      "description": "Checkpoint del gobernador en el que actuó (construyó, investigó, promocionó, fundó o movió > 0,5 personas): qué hizo, el segundo candidato y por qué. Fuera de ausencias.",
+      "properties": {
+        "node_id": {"type": "number", "description": "Id del nodo"},
+        "tier": {"type": "number", "description": "Escala del nodo"},
+        "depth": {"type": "number", "description": "Distancia a la raíz (0 = raíz)"},
+        "actions": {"type": "string", "description": "Lo hecho, p. ej. build:farm,upgrade:x,jobs"},
+        "built": {"type": "string", "description": "Edificio construido, o vacío"},
+        "built_score": {"type": "number", "description": "Puntuación del construido"},
+        "runner_up": {"type": "string", "description": "Segundo candidato, o vacío"},
+        "runner_up_score": {"type": "number", "description": "Puntuación del segundo"},
+        "upgraded": {"type": "string", "description": "Mejora comprada, o vacío"},
+        "promoted": {"type": "bool", "description": "Promocionó el nodo"},
+        "founded": {"type": "bool", "description": "Fundó un hijo"},
+        "jobs_moved": {"type": "number", "description": "Personas movidas en el reparto (Σ|Δjobs|)"},
+        "limit": {"type": "string", "description": "Cuello de botella: food | housing | none"},
+        "food_limited": {"type": "bool", "description": "La comida pone el techo"},
+        "housing_urgency": {"type": "number", "description": "Urgencia de alojamiento"},
+        "storage_urgency": {"type": "number", "description": "Urgencia de almacén"},
+        "idle_share": {"type": "number", "description": "Ociosos / población"},
+        "shortage": {"type": "number", "description": "Recursos en falta"},
+        "w_food": {"type": "number", "description": "Peso de comida (normalizado)"},
+        "w_growth": {"type": "number", "description": "Peso de crecimiento (normalizado)"},
+        "w_industry": {"type": "number", "description": "Peso de industria (normalizado)"},
+        "w_expansion": {"type": "number", "description": "Peso de expansión (normalizado)"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "node_sample",
+      "description": "Foto de cada nodo vivo cada 300 ciclos de juego. Sin actor. food_cap = -1 si la comida no limita; cap_use e idle_share ya calculados.",
+      "properties": {
+        "node_id": {"type": "number", "description": "Id del nodo"},
+        "tier": {"type": "number", "description": "Escala del nodo"},
+        "depth": {"type": "number", "description": "Distancia a la raíz (0 = raíz)"},
+        "delegated": {"type": "bool", "description": "El nodo está delegado al gobernador"},
+        "children": {"type": "number", "description": "Hijos directos"},
+        "pop": {"type": "number", "description": "Población"},
+        "cap": {"type": "number", "description": "Techo de población (el menor de alojamiento y comida)"},
+        "housing": {"type": "number", "description": "Alojamiento"},
+        "food_cap": {"type": "number", "description": "Población que sostiene la comida; -1 = no limita"},
+        "limit": {"type": "string", "description": "Cuello de botella: food | housing | none"},
+        "idle": {"type": "number", "description": "Ociosos"},
+        "buildings": {"type": "number", "description": "Edificios del nodo"},
+        "fill_food": {"type": "number", "description": "Llenado del almacén de comida (stock/tope)"},
+        "fill_wood": {"type": "number", "description": "Llenado de madera (stock/tope)"},
+        "fill_stone": {"type": "number", "description": "Llenado de piedra (stock/tope)"},
+        "fill_tools": {"type": "number", "description": "Llenado de herramientas (stock/tope)"},
+        "fill_gold": {"type": "number", "description": "Llenado de oro (stock/tope)"},
+        "culture": {"type": "number", "description": "Cultura acumulada (sin tope)"},
+        "jobs_hut": {"type": "number", "description": "Personas destinadas a cabañas"},
+        "jobs_farm": {"type": "number", "description": "Personas destinadas a granjas"},
+        "jobs_woodcutter": {"type": "number", "description": "Personas destinadas a leñadores"},
+        "jobs_storehouse": {"type": "number", "description": "Personas destinadas a almacenes"},
+        "jobs_quarry": {"type": "number", "description": "Personas destinadas a canteras"},
+        "jobs_workshop": {"type": "number", "description": "Personas destinadas a talleres"},
+        "jobs_commons": {"type": "number", "description": "Personas destinadas a casas comunales"},
+        "jobs_depot": {"type": "number", "description": "Personas destinadas a depósitos"},
+        "jobs_market": {"type": "number", "description": "Personas destinadas a mercados"},
+        "jobs_temple": {"type": "number", "description": "Personas destinadas a templos"},
+        "cap_use": {"type": "number", "description": "pop / cap"},
+        "idle_share": {"type": "number", "description": "idle / pop"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego (múltiplo de 300); se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "offline_return",
+      "description": "Resumen de una ausencia acreditada de golpe al volver (un evento por vuelta). Sin actor.",
+      "properties": {
+        "away_s": {"type": "number", "description": "Segundos fuera, sin recortar"},
+        "credited_s": {"type": "number", "description": "Segundos acreditados (con el tope)"},
+        "capped": {"type": "bool", "description": "La ausencia superó el tope y se recortó"},
+        "nodes_delegated": {"type": "number", "description": "Nodos delegados al volver"},
+        "pop_before": {"type": "number", "description": "Población total antes"},
+        "pop_after": {"type": "number", "description": "Población total después"},
+        "built": {"type": "number", "description": "Edificios levantados (los de la pantalla de vuelta)"},
+        "upgraded": {"type": "number", "description": "Mejoras compradas"},
+        "founded": {"type": "number", "description": "Hijos fundados por el gobernador"},
+        "promoted": {"type": "number", "description": "Promociones del gobernador"},
+        "decisions": {"type": "number", "description": "Decisiones del gobernador durante la ausencia"},
+        "collapsed": {"type": "number", "description": "Nodos colapsados al final de la barra"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego tras acreditar"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    }
+  ]
+}

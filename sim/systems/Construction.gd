@@ -8,8 +8,16 @@ extends RefCounted
 ## delegar no puede divergir de jugar a mano.
 
 
+## **La única puerta** al coste de un edificio: la UI, el gobernador, `ceiling_dump` y los tests
+## del muro pasan por aquí. Una escala más alta paga más por todo (`TierDef.cost_scale`); un
+## `cost_for` suelto pesaría el precio de aldea y el gobernador se quedaría esperando.
 static func cost_of(node: SimNode, building_index: int) -> PackedFloat64Array:
-	return Content.building(building_index).cost_for(node.buildings[building_index])
+	var cost := Content.building(building_index).cost_for(node.buildings[building_index])
+	var scale := node.def().cost_scale
+	if scale != 1.0:
+		for i in cost.size():
+			cost[i] *= scale
+	return cost
 
 
 static func is_available(node: SimNode, building_index: int) -> bool:
