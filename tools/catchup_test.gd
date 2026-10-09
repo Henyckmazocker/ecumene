@@ -35,6 +35,10 @@ func _init() -> void:
 	# Con una expedición en camino que llega a mitad de un paso (Expediciones M1).
 	failures += _same_state_with_expedition("expedición, padre delegado", true)
 	failures += _same_state_with_expedition("expedición, sin delegar", false)
+	# ⚡ Con boosts que expiran a mitad de un paso (M0 de Objetos de tiempo).
+	failures += _boost_chunked_equals_whole()
+	# ⌛ Un salto va por la misma barra que una ausencia (M3 de Objetos de tiempo).
+	failures += _skip_chunked_equals_whole()
 	failures += _the_report_is_the_same()
 	failures += _closing_twice_reports_once()
 	failures += _a_step_always_happens()
@@ -241,3 +245,101 @@ func _expedition_engine(delegated: bool) -> SimEngine:
 	# Un poco de juego antes de cerrar, para que la llegada no caiga en el borde de un paso.
 	engine.tick(7.3)
 	return engine
+
+
+## **⚡ Troceado = de un tirón, con nodos a otro ritmo.** Dos escenarios: la ruta del spike con el
+## hijo a ×4 y el padre delegado a ×2, y el pueblo delegado con su expedición en camino y él a ×2
+## (la llegada se recalcula al usar el boost). Los boosts acaban a mitad de un paso del troceado
+## —`SimEngine.tick` parte el paso ahí— y consumir los pasos a otro ritmo no puede mover nada: ni
+## el `state_hash` ni lo que aún no entra en él (ritmo, relojes y gobernador de cada nodo).
+func _boost_chunked_equals_whole() -> int:
+	var failures := 0
+	for with_expedition in [false, true]:
+		var label: String = "⚡ expedición, padre delegado a ×2" if with_expedition \
+			else "⚡ ruta, hijo a ×4 y padre delegado a ×2"
+		var jump := _boosted_engine(with_expedition)
+		var framed := _boosted_engine(with_expedition)
+		var away := 12.0 * 3600.0
+		jump.catch_up(away)
+		var job := framed.begin_catch_up(away)
+		var frames := 0
+		while not framed.advance_catch_up(job, 0.001):
+			frames += 1
+			if frames > 1000:
+				break
+		var a := jump.state.state_hash()
+		var b := framed.state.state_hash()
+		var same_clocks := _clocks(jump) == _clocks(framed)
+		var expired := framed.state.min_boost_until == INF
+		failures += TestUtil.check(
+			a == b and same_clocks and expired and job.steps > 1,
+			"%s: %d pasos en %d fotogramas dan lo mismo que de un tirón (hash %d), y los boosts se han apagado"
+				% [label, job.steps, frames + 1, b],
+			"%s: troceado ≠ de un tirón (%d != %d), relojes iguales %s, boosts apagados %s, %d pasos"
+				% [label, b, a, same_clocks, expired, job.steps]
+		)
+	return failures
+
+
+func _boosted_engine(with_expedition: bool) -> SimEngine:
+	var engine: SimEngine
+	if with_expedition:
+		engine = _expedition_engine(true)
+		SimEngine.apply_boost(engine.state, engine.state.root(), 2.0, 700.0)
+	else:
+		engine = TestUtil.make_routed_engine(90212)
+		var root := engine.state.root()
+		root.governor = Governor.balanced()
+		root.governor.may_expand = false
+		SimEngine.apply_boost(engine.state, engine.state.nodes[root.children[0]], 4.0, 1250.0)
+		SimEngine.apply_boost(engine.state, root, 2.0, 2000.0)
+	return engine
+
+
+## Ritmo, fin del boost, reloj propio y del gobernador de cada nodo, y llegada de cada expedición.
+func _clocks(engine: SimEngine) -> String:
+	var parts := PackedStringArray()
+	for id in engine.state.ordered_ids():
+		var n: SimNode = engine.state.nodes[id]
+		parts.append("%d:%s:%s:%s:%s" % [id, var_to_str(n.boost_factor), var_to_str(n.boost_until),
+			var_to_str(n.local_cycle), var_to_str(n.governor_last_cycle)])
+	for e in engine.state.expeditions:
+		parts.append("e%d:%s" % [e.parent_id, var_to_str(e.arrive_cycle)])
+	return ",".join(parts)
+
+
+## **⌛ Un salto troceado da lo mismo que de un tirón.** `begin_skip` usa el troceado de la ausencia
+## (`_job_for`), así que con nodos delegados un `skip_4h` son 64 pasos que la barra consume a lo
+## largo de los fotogramas; a qué ritmo, no puede notarse. Dos escenarios: el pueblo delegado y la
+## ruta con nodos a ×2 y ×4 cuyos boosts acaban a mitad del salto. Y un salto no deja informe de
+## vuelta: el de la última ausencia no se pisa ni se inventa uno.
+func _skip_chunked_equals_whole() -> int:
+	var failures := 0
+	for boosted in [false, true]:
+		var label: String = "⌛ ruta con ⚡ ×2 y ×4" if boosted else "⌛ pueblo delegado"
+		var jump := _boosted_engine(false) if boosted else _engine(true)
+		var framed := _boosted_engine(false) if boosted else _engine(true)
+		for e in [jump, framed]:
+			Shop.grant(e.state, "skip_4h", 1, null, "test")
+		var whole := jump.use_skip("skip_4h")
+		while not jump.advance_catch_up(whole, 0.0):
+			pass
+		var job := framed.use_skip("skip_4h")
+		var frames := 0
+		while not framed.advance_catch_up(job, 0.001):
+			frames += 1
+			if frames > 1000:
+				break
+		var a := jump.state.state_hash()
+		var b := framed.state.state_hash()
+		var same_clocks := _clocks(jump) == _clocks(framed)
+		var online := job.is_skip and job.cycles == 14400.0 and framed.state.cycle == 14400.0 \
+			and framed.last_offline == null and Shop.count_of(framed.state, "skip_4h") == 0
+		failures += TestUtil.check(
+			a == b and same_clocks and online and job.steps > 1,
+			"%s: %d pasos en %d fotogramas dan lo mismo que de un tirón (hash %d), 14.400 ciclos y sin informe"
+				% [label, job.steps, frames + 1, b],
+			"%s: troceado ≠ de un tirón (%d != %d), relojes iguales %s, salto online %s, %d pasos"
+				% [label, b, a, same_clocks, online, job.steps]
+		)
+	return failures

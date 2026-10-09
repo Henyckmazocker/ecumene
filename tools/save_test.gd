@@ -111,6 +111,14 @@ func _init() -> void:
 	failures += _accelerated_expedition_round_trip()
 	failures += _v4_loads_without_accelerations()
 
+	# --- Objetos de tiempo (M2): inventario, goteo y un ⚡ a medias bit a bit; un v4 carga sin ellos ---
+	failures += _items_survive_save()
+	failures += _v4_loads_without_items()
+
+	# --- 🎖️ Gobernador por sello (M2): el sello sobrevive, y un v5 delegado carga sellado ---
+	failures += _seal_survives_save()
+	failures += _v5_delegated_stays_sealed()
+
 	# --- Región (M2): un save de seis recursos carga con el 🐎 a cero ---
 	failures += _six_goods_save_loads()
 
@@ -592,5 +600,183 @@ func _v4_loads_without_accelerations() -> int:
 		"⏩ el save v4 no carga limpio: esquema %s, expedición %s, hash %d (era %d)" % [
 			raw.get("schema"), e.to_dict() if e != null else "ninguna",
 			loaded.state_hash(), V4_HASH,
+		]
+	)
+
+
+## **Objetos (M2 de Objetos de tiempo): inventario, goteo y un ⚡ a medias sobreviven bit a bit.**
+## El boost se pone en un hijo enrutado al padre y se guarda a mitad: lo que tiene que volver es
+## el ritmo, su fin en ciclos globales y el reloj propio, que ya va por delante del mundo. Y la
+## partida cargada tiene que seguir igual que la que no se guardó, cruzando el fin del boost.
+func _items_survive_save() -> int:
+	var engine := TestUtil.make_routed_engine(870)
+	var state := engine.state
+	for _i in 30:
+		engine.tick(1.0)
+	var child: SimNode = state.nodes[state.routes[0].to_id] if not state.routes.is_empty() \
+		else state.root()
+	SimEngine.apply_boost(state, child, 2.0, 120.0)
+	for _i in 50:
+		engine.tick(1.0)
+	state.items = {"skip_15m": 3, "boost_x4": 1, "seal": 2}
+	state.drip_cycle = 17.25
+	state.drip_held = 2
+	var before := state.state_hash()
+	Save.write(state)
+	var loaded := Save.read([])
+	if loaded == null:
+		return TestUtil.check(false, "", "objetos: el save no se lee de vuelta")
+	var back: SimNode = loaded.nodes.get(child.id)
+	var same_items := true
+	for def in Items.all():
+		if int(loaded.items.get(def.id, 0)) != int(state.items.get(def.id, 0)):
+			same_items = false
+	var failures := TestUtil.check(
+		same_items and loaded.drip_cycle == 17.25 and loaded.drip_held == 2
+			and back != null and back.boost_factor == 2.0
+			and back.boost_until == child.boost_until and back.local_cycle == child.local_cycle
+			and back.local_cycle > loaded.cycle
+			and loaded.min_boost_until == state.min_boost_until
+			and loaded.state_hash() == before,
+		"objetos: inventario, goteo (%.2f, %d) y un ⚡ ×2 a medias (reloj %.1f en el ciclo %.1f) sobreviven bit a bit" % [
+			loaded.drip_cycle, loaded.drip_held,
+			back.local_cycle if back != null else -1.0, loaded.cycle,
+		],
+		"objetos: el guardado los altera: %s vs %s, goteo %.2f/%d, nodo %s, hash %d vs %d" % [
+			loaded.items, state.items, loaded.drip_cycle, loaded.drip_held,
+			back.to_dict() if back != null else "ninguno", loaded.state_hash(), before,
+		]
+	)
+	# Sin un objeto en el inventario, la huella no puede ser la misma: si lo fuese, `state_hash` no
+	# lo estaría mirando y el round-trip de arriba no probaría nada.
+	var without := WorldState.from_dict(state.to_dict())
+	without.items.erase("seal")
+	failures += TestUtil.check(
+		without.state_hash() != before,
+		"objetos: el inventario entra en `state_hash`",
+		"objetos: quitar un 🎖️ del inventario no cambia `state_hash`"
+	)
+	var twin := TestUtil.make_engine(870)
+	twin.adopt(loaded)
+	for _i in 100:
+		engine.tick(1.0)
+		twin.tick(1.0)
+	failures += TestUtil.check(
+		engine.state.state_hash() == twin.state.state_hash()
+			and (twin.state.nodes[child.id] as SimNode).boost_factor == 1.0,
+		"objetos: la partida cargada sigue igual que la original cruzando el fin del ⚡",
+		"objetos: cargar con un ⚡ a medias desvía la partida de la original"
+	)
+	return failures
+
+
+## **El save v4 de verdad** (`tools/fixtures/save_v4.save`) carga sin objetos, con el goteo en el
+## ciclo en que se guardó (300) y cada nodo sin boost y con el reloj del mundo. Y con la huella de
+## entonces: lo nuevo solo entra en `state_hash` cuando se aparta de eso.
+func _v4_loads_without_items() -> int:
+	var bytes := FileAccess.get_file_as_bytes(V4_FIXTURE)
+	if bytes.is_empty():
+		return TestUtil.check(false, "", "no se encuentra el save v4 de prueba %s" % V4_FIXTURE)
+	var file := FileAccess.open(Save.PATH, FileAccess.WRITE)
+	file.store_buffer(bytes)
+	file.close()
+	var loaded := Save.read([])
+	if loaded == null:
+		return TestUtil.check(false, "", "objetos: el save v4 no carga")
+	var plain := true
+	for id in loaded.ordered_ids():
+		var n: SimNode = loaded.nodes[id]
+		if n.boost_factor != 1.0 or n.boost_until != 0.0 or n.local_cycle != loaded.cycle:
+			plain = false
+	return TestUtil.check(
+		loaded.items.is_empty() and loaded.drip_cycle == loaded.cycle and loaded.cycle == 300.0
+			and loaded.drip_held == 0 and plain and loaded.min_boost_until == INF
+			and loaded.state_hash() == V4_HASH,
+		"objetos: un save v4 carga como v%d sin inventario, goteo desde el ciclo %.0f, sin ⚡ y con el hash de entonces" % [
+			WorldState.SCHEMA_VERSION, loaded.drip_cycle,
+		],
+		"objetos: el save v4 no carga limpio: %s, goteo %.1f/%d, nodos sin boost %s, hash %d (era %d)" % [
+			loaded.items, loaded.drip_cycle, loaded.drip_held, plain, loaded.state_hash(), V4_HASH,
+		]
+	)
+
+
+## **🎖️ El sello sobrevive al guardado**, también en el caso que el gobernador no delata: sellado y
+## con el mando retomado. Entra en el hash solo cuando dice algo que el gobernador no diga ya, así
+## que se mira a los ojos además del hash.
+func _seal_survives_save() -> int:
+	var engine := TestUtil.make_engine(880)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.TOWN
+	root.pop = 500.0
+	root.stocks[Goods.FOOD] = 500.0
+	state.refresh_totals()
+	state.legacy_nodes = PackedStringArray(["council"])
+	var child := TestUtil.found_now(state, root, engine.params)
+	Shop.grant(state, "seal", 1, null, "test")
+	Shop.use_seal(state, child, false, engine.events)
+	child.governor = null
+	for _i in 10:
+		engine.tick(10.0)
+	var before := state.state_hash()
+	child.governor_unlocked = false
+	var unsealed := state.state_hash()
+	child.governor_unlocked = true
+	Save.write(state)
+	var loaded := Save.read([])
+	var back: SimNode = loaded.get_node_by_id(child.id) if loaded != null else null
+	return TestUtil.check(
+		back != null and back.governor_unlocked and back.governor == null
+			and not loaded.root().governor_unlocked and loaded.state_hash() == before
+			and unsealed != before and GovernorSys.delegate_blocker(loaded, back) == "",
+		"🎖️ un hijo sellado y a mano sigue sellado al cargar, con el hash de antes, y se delega sin otro sello",
+		"🎖️ el sello no sobrevive: %s, hash %d (era %d), sin sello daría %d" % [
+			"sin nodo" if back == null else "sellado %s, gobernador %s" % [
+				back.governor_unlocked, back.governor != null],
+			loaded.state_hash() if loaded != null else 0, before, unsealed,
+		]
+	)
+
+
+## **Un save v5 con un nodo delegado carga sellado** (migración 5 → 6): nadie pierde el gobernador
+## que tenía. Lo que no estaba delegado carga sin sellar. El dict v5 se hace aquí, como en
+## `_v2_loads_without_routes`: un v5 es un v6 sin `gov_unlocked`.
+func _v5_delegated_stays_sealed() -> int:
+	var engine := TestUtil.make_engine(881)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.TOWN
+	root.pop = 500.0
+	root.stocks[Goods.FOOD] = 500.0
+	state.refresh_totals()
+	var child := TestUtil.found_now(state, root, engine.params)
+	GovernorSys.delegate(state, root, Governor.balanced())
+	for _i in 10:
+		engine.tick(10.0)
+	var old := state.to_dict()
+	old["schema"] = 5
+	for node_data in old["nodes"]:
+		(node_data as Dictionary).erase("gov_unlocked")
+	var migrated := Save.migrate(old)
+	if migrated.is_empty():
+		return TestUtil.check(false, "", "un save v5 se rechaza en vez de migrarse")
+	var loaded := WorldState.from_dict(migrated)
+	var back: SimNode = loaded.get_node_by_id(child.id)
+	# La huella esperada es la del estado con la raíz sellada, que es lo que hace la migración.
+	root.governor_unlocked = true
+	var expected := state.state_hash()
+	loaded.legacy_nodes = PackedStringArray(["council"])
+	return TestUtil.check(
+		int(migrated["schema"]) == WorldState.SCHEMA_VERSION
+			and loaded.root().governor_unlocked and loaded.root().is_delegated()
+			and back != null and not back.governor_unlocked
+			and loaded.state_hash() == expected
+			and GovernorSys.delegate_blocker(loaded, loaded.root()) == "",
+		"🎖️ un save v5 carga como v%d con la raíz delegada sellada y el hijo a mano sin sellar" % (
+			WorldState.SCHEMA_VERSION),
+		"🎖️ el v5 no carga bien: esquema %d, raíz sellada %s, hijo sellado %s, hash %d (esperado %d)" % [
+			int(migrated["schema"]), loaded.root().governor_unlocked,
+			back != null and back.governor_unlocked, loaded.state_hash(), expected,
 		]
 	)

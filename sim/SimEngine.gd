@@ -105,23 +105,29 @@ func tick(dt: float) -> void:
 
 	# El tramo se parte en cada llegada de una expedición: el hijo nace en el ciclo exacto y crece
 	# el resto del tramo, así que tickear de 1 en 1 o de un salto da la misma colonia (regla 4).
-	# Sin expediciones es un solo tramo de `dt`, como siempre. Las decisiones van después, una vez.
+	# Y en cada fin de ⚡ boost, por lo mismo: el nodo pasa de `k` a 1 en su ciclo exacto. Sin
+	# expediciones ni boosts es un solo tramo de `dt`, como siempre. Las decisiones van después,
+	# una vez.
 	var target := state.cycle + dt
 	var left := dt
 	while true:
-		var next := state.next_arrival()
+		var next := minf(state.next_arrival(), state.min_boost_until)
 		# El reloj se pone al final del tramo **antes** de avanzarlo, como siempre: lo que se anota
 		# durante el avance (una hambruna) sale con el ciclo en que acaba el tramo.
 		if next > target:
+			var from := state.cycle
 			state.cycle = target
 			if left > 0.0:
-				_advance_all(left, routed, base, delegated)
+				_advance_all(from, left, routed, base, delegated)
 			break
 		var span := next - state.cycle
 		if span > 0.0:
+			var from := state.cycle
 			state.cycle = next
-			_advance_all(span, routed, base, delegated)
+			_advance_all(from, span, routed, base, delegated)
 		left = target - state.cycle
+		if state.min_boost_until <= state.cycle:
+			_expire_boosts()
 		for e in state.pop_arrivals(next):
 			Promotion.arrive(state, e, events)
 
@@ -130,6 +136,9 @@ func tick(dt: float) -> void:
 	# las que de verdad avanzan, y fundaría o construiría a destiempo.
 	for id in state.ordered_ids():
 		GovernorSys.run(state, state.nodes[id], params, events, delegated)
+
+	# ⌛ Goteo: mira `state.cycle`, así que da lo mismo de 1 en 1, de un salto o troceado.
+	Shop.drip(state, params, events)
 
 	_prune()
 	state.refresh_totals()
@@ -140,8 +149,13 @@ func tick(dt: float) -> void:
 ## Un tramo sin llegadas: los nodos con rutas juntos y el resto cada uno con
 ## `Integrator.advance`. Es el cuerpo de `tick` de antes de las expediciones, partido para que un
 ## hijo pueda nacer entre dos tramos.
+##
+## ⚡ Un nodo con boost `k` integra `k·span` (y sus rutas, `Logistics.advance_routed`, a `1/k`):
+## como la producción es lineal y el integrador tiene forma cerrada, N×1 == N sigue en pie.
+## `from` es el ciclo en que empieza el tramo; `state.cycle` ya está en el final.
 func _advance_all(
-	span: float, routed: PackedInt32Array, base: Integrator.Modifiers, delegated: Integrator.Modifiers
+	from: float, span: float, routed: PackedInt32Array, base: Integrator.Modifiers,
+	delegated: Integrator.Modifiers
 ) -> void:
 	# Los nodos con rutas avanzan juntos, porque una ruta se corta en los dos extremos a la vez
 	# (ver `Logistics`). Cada uno sigue avanzando solo con `Integrator.advance`; lo único que
@@ -159,9 +173,59 @@ func _advance_all(
 		# campo nuevo cambiaría el save y el `state_hash` por algo que solo es un aviso.
 		var was_starving: bool = was_routed_starving.get(id, node.starving)
 		if not was_routed_starving.has(id):
-			Integrator.advance(node, params, span, delegated if node.is_delegated() else base)
+			Integrator.advance(node, params, span * node.boost_factor,
+				delegated if node.is_delegated() else base)
+		_advance_local_clock(node, from, span)
 		if node.starving and not was_starving and node.is_delegated():
 			_warn_famine(node)
+
+
+## El reloj propio del nodo avanza `k·span`. Un nodo al paso del mundo (sin boost y con el reloj en
+## `from`, o detrás si alguien ha movido `state.cycle` a mano) **copia** `state.cycle` en vez de
+## sumar: `from + span` puede caer a un ulp del final del tramo, y entonces la cadencia del
+## gobernador —que antes contaba con `state.cycle`— cambiaría por un bit. Así, sin boost,
+## `local_cycle == state.cycle` siempre y nada de lo de antes se mueve. Un nodo que tuvo boost va
+## por delante del mundo, y ese suma.
+func _advance_local_clock(node: SimNode, from: float, span: float) -> void:
+	if node.boost_factor == 1.0 and node.local_cycle <= from:
+		node.local_cycle = state.cycle
+	else:
+		node.local_cycle += span * node.boost_factor
+
+
+## Apaga los ⚡ boosts que acaban en este ciclo. No toca ninguna expedición: `Expedition.arrival`
+## ya contó con el fin del boost al calcular la llegada.
+func _expire_boosts() -> void:
+	for id in state.ordered_ids():
+		var node: SimNode = state.nodes[id]
+		if node.boost_factor != 1.0 and node.boost_until <= state.cycle:
+			node.boost_factor = 1.0
+			node.boost_until = 0.0
+	state.refresh_boost_end()
+
+
+## ⚡ Pone `node` a ritmo `factor` durante `cycles` ciclos **globales** desde ahora. Es la operación
+## entera de usar un boost, sin pagar nada: la llamarán `Shop.use_boost` (M3 del plan) y los tests.
+## Vive aquí porque es del reloj, como partir el tramo y expirarlo; es estática y pura, como los
+## sistemas, para que tienda y tests la llamen sin motor.
+##
+## **No se apila:** con un boost activo se queda el mayor de los dos factores y la duración se
+## renueva desde ahora, no se suma. La expedición en camino del nodo, si la hay, se recalcula en
+## forma cerrada —lo que le quedaba en ciclos del nodo con el ritmo viejo, y su llegada con el
+## nuevo— y se saca y se vuelve a meter, como ⏩ (`Promotion.accelerate_expedition`): puede
+## adelantar a otra en el orden de llegada.
+static func apply_boost(state_: WorldState, node: SimNode, factor: float, cycles: float) -> void:
+	var now := state_.cycle
+	var e := state_.cancel_expedition_of(node.id)
+	var left := 0.0
+	if e != null:
+		left = Expedition.remaining_local(e.arrive_cycle, now, node.boost_factor, node.boost_until)
+	node.boost_factor = maxf(node.boost_factor, factor)
+	node.boost_until = now + cycles
+	if e != null:
+		e.arrive_cycle = Expedition.arrival(now, left, node.boost_factor, node.boost_until)
+		state_.add_expedition(e)
+	state_.refresh_boost_end()
 
 
 ## Informe de la última ausencia acreditada, para la pantalla de vuelta. `null` si no hubo.
@@ -193,6 +257,9 @@ class CatchUpJob extends RefCounted:
 	## vuelta en el diario, y quien conduce la acreditación puede llamar de más (ver el mínimo
 	## de tiempo que la barra se queda en pantalla).
 	var reported: bool = false
+	## ⌛ Es un salto (`begin_skip`), no una ausencia: tiempo online, y al acabar no se compone
+	## `OfflineReport` ni se anota la vuelta. `credited` son entonces los segundos que avanza.
+	var is_skip: bool = false
 
 	func progress() -> float:
 		return float(done) / float(maxi(steps, 1))
@@ -232,7 +299,43 @@ func begin_catch_up(elapsed_seconds: float) -> CatchUpJob:
 	var cycles := credited * efficiency / params.seconds_per_cycle
 	if cycles <= 0.0:
 		return null
+	return _job_for(cycles, credited, elapsed_seconds > cap)
 
+
+## ⌛ Prepara un salto de `cycles` ciclos y **no da ningún paso**, como `begin_catch_up`. Es tiempo
+## online: sin tope y a eficiencia 1, así que solo comparte con la ausencia el troceado
+## (`_job_for`) y la barra. Los pasos siguen siendo `tick(chunk)` (regla 4), y el goteo, que mira
+## `state.cycle`, corre dentro del salto como fuera. `null` si no hay nada que saltar o si ya hay
+## una acreditación a medias: dos troceados a la vez no son un troceado.
+func begin_skip(cycles: float) -> CatchUpJob:
+	if state == null or cycles <= 0.0 or _catch_up_job != null:
+		return null
+	var job := _job_for(cycles, cycles * params.seconds_per_cycle, false)
+	job.is_skip = true
+	return job
+
+
+## ⌛ Por qué no se puede usar el salto `id` ahora; vacío si se puede. El motor sabe lo que el
+## estado no: si hay una acreditación a medias.
+func skip_blocker(id: String) -> String:
+	if state == null:
+		return "no hay partida"
+	return Shop.use_blocker(state, state.root(), id, false, _catch_up_job != null)
+
+
+## ⌛ Gasta el salto `id` (`Shop.spend_skip`, anotado sobre `node`) y prepara su troceado. `null`
+## si no se puede (`skip_blocker`). Quien conduce consume el trabajo con `advance_catch_up`, igual
+## que una ausencia: `Main.use_skip` lo engancha a la barra.
+func use_skip(id: String, node: SimNode = null) -> CatchUpJob:
+	if not skip_blocker(id).is_empty():
+		return null
+	var cycles := Shop.spend_skip(state, node if node != null else state.root(), id, events)
+	return begin_skip(cycles)
+
+
+## Trocea `cycles` ciclos en pasos y guarda la foto de `before`. Es la mitad de `begin_catch_up`
+## que no sabe de dónde salen los ciclos: la comparten la ausencia y el ⌛ salto.
+func _job_for(cycles: float, credited: float, capped: bool) -> CatchUpJob:
 	# El avance del tiempo se compone; **las decisiones no**. Con un solo salto, un nodo
 	# delegado crecería hasta el techo de los edificios que tenía cuando cerraste el juego y
 	# el gobernador construiría todo de golpe al final, desperdiciando la ausencia entera.
@@ -250,7 +353,7 @@ func begin_catch_up(elapsed_seconds: float) -> CatchUpJob:
 	job.chunk = cycles / float(job.steps)
 	job.credited = credited
 	job.cycles = cycles
-	job.capped = elapsed_seconds > cap
+	job.capped = capped
 	job.before = OfflineReport.snapshot(state)
 	_catch_up_job = job
 	return job
@@ -276,6 +379,9 @@ func advance_catch_up(job: CatchUpJob, budget_msec: float = 0.0) -> bool:
 	job.reported = true
 	if _catch_up_job == job:
 		_catch_up_job = null
+	# Un ⌛ no es una vuelta: ni informe ni anuncio (lo cuenta `item_used`, anotado al usarlo).
+	if job.is_skip:
+		return true
 	last_offline = OfflineReport.build(job.before, state, params, job.credited, job.cycles,
 		job.capped, governor_efficiency())
 	_push_system("offline", state.cycle, state.root_id,
@@ -339,6 +445,7 @@ static func _modifiers(bonus: Ascension.Bonuses) -> Integrator.Modifiers:
 ## Retira los nodos que han colapsado por hambruna. La raíz nunca se retira: si se vacía,
 ## la partida sigue con lo que queda (reiniciar es decisión del jugador, no del motor).
 func _prune() -> void:
+	var pruned := false
 	for id in state.ordered_ids():
 		var node: SimNode = state.nodes.get(id)
 		if node == null or node.id == state.root_id:
@@ -351,6 +458,7 @@ func _prune() -> void:
 			if idx >= 0:
 				parent.children.remove_at(idx)
 		state.nodes.erase(id)
+		pruned = true
 		# Sus rutas se van con él, en el mismo paso: el siguiente checkpoint no puede encontrarse
 		# una ruta con un extremo que ya no existe.
 		Logistics.drop_routes_of(state, id)
@@ -367,6 +475,9 @@ func _prune() -> void:
 			data["expedition_lost"] = lost.pop
 			text += ", y con él la expedición que había mandado"
 		_push_system("collapse", state.cycle, id, text, data)
+	# Su boost se va con él, pero la caché del próximo fin podría seguir apuntándole.
+	if pruned:
+		state.refresh_boost_end()
 
 
 ## Un nodo delegado acaba de **entrar** en hambruna: se anota una vez por episodio, no por ciclo,

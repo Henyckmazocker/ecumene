@@ -22,6 +22,7 @@ enum Effect {
 	START_LEGACY,    ## recursos de partida en cada era nueva
 	HEIRS,           ## generaciones de colonias delegadas que también colonizan
 	EXPEDITION,      ## fracción que se resta a la duración de las expediciones
+	GOVERNOR_UNLOCK, ## sellos de regalo por era; rango ≥ 1 abre la delegación
 }
 
 class Node_:
@@ -77,9 +78,10 @@ static func _make(
 	return n
 
 
-## Las dos ramas cuelgan de dos raíces: **la tierra** (lo que produce el mundo mientras juegas)
-## y **la crónica** (lo que ocurre mientras no estás). El orden de la lista solo decide el de las
-## raíces; a cada hijo lo coloca bajo su padre quien dibuja el árbol.
+## Las ramas cuelgan de tres raíces: **la tierra** (lo que produce el mundo mientras juegas),
+## **la crónica** (lo que ocurre mientras no estás) y **el consejo** (lo que mandas sin estar). El
+## orden de la lista solo decide el de las raíces; a cada hijo lo coloca bajo su padre quien
+## dibuja el árbol.
 static func _build() -> void:
 	_nodes = [
 		_make("fertile_soil", "Tierra fértil", "🌾",
@@ -88,6 +90,13 @@ static func _build() -> void:
 		_make("chronicle", "Crónica", "📜",
 			"El mundo sigue sin ti: +12 h de crédito offline por rango.",
 			Effect.OFFLINE_CAP, 12.0, 4, 6.0, 2.5),
+		# La llave de los gobernadores, no un bono: con un rango se puede delegar lo que esté
+		# sellado. Y cada rango regala un 🎖️ Sello al comprarlo (`Ascension.buy`) y otro al
+		# empezar cada era (`Ascension.ascend`), porque el oro para comprarlo solo llega en Ciudad y sin él la llave no abriría nada
+		# hasta media era. A 6, una ascensión en Ciudad (28 de legado) la compra seguro.
+		_make("council", "Consejo", "🎖️",
+			"Abre los gobernadores: cada nodo que selles se puede delegar. +1 🎖️ Sello al comprarlo y otro al empezar cada era, por rango.",
+			Effect.GOVERNOR_UNLOCK, 1.0, 3, 6.0, 2.4),
 
 		_make("old_crafts", "Oficios antiguos", "⚒️",
 			"Las técnicas no se olvidan: +10 % de producción general por rango.",
@@ -101,7 +110,7 @@ static func _build() -> void:
 
 		_make("stewards", "Escuela de gobernadores", "🎓",
 			"Delegar duele menos: +4 % de eficiencia en los nodos delegados por rango.",
-			Effect.GOVERNOR, 0.04, 4, 10.0, 2.6, ["old_crafts"]),
+			Effect.GOVERNOR, 0.04, 4, 10.0, 2.6, ["council"]),
 		_make("stone_roots", "Raíces de piedra", "🪨",
 			"Se construye más denso: +10 % de alojamiento por rango.",
 			Effect.HOUSING, 0.10, 5, 4.0, 2.3, ["lineage"]),

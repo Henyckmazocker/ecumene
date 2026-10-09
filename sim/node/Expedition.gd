@@ -13,7 +13,9 @@ extends RefCounted
 ##
 ## La duración se fija **al salir** y no cambia sola en camino: es una constante del tramo, no una
 ## tasa que integrar. Lo único que la mueve es ⏩ acelerar con oro (`Promotion.accelerate_expedition`),
-## que es una acción discreta entre ticks, como construir.
+## que es una acción discreta entre ticks, como construir, y el ⚡ boost de su nodo, que hace que el
+## viaje cuente en ciclos **del nodo**: `remaining_local` y `arrival` recalculan la llegada en forma
+## cerrada cada vez que cambia el ritmo (al lanzar y al usar un boost; expirar ya está contado).
 
 var parent_id: int = -1
 var depart_cycle: float = 0.0
@@ -35,6 +37,30 @@ var actor: String = "player"
 ## Cuántas veces se ha acelerado con oro: encarece la siguiente (`Promotion.accelerate_cost`). Es
 ## estado —decide cuánto cuesta lo próximo—, así que entra en el save y en el `state_hash`.
 var accelerations: int = 0
+
+
+## ⚡ Viaje que le queda a una expedición que llega en `arrive` (ciclo global), en ciclos **del
+## nodo**, visto desde el ciclo global `t` con el ritmo `(k, until)` que tiene ahora su emisor.
+## Hasta `until` cada ciclo global son `k` del nodo; después, uno.
+static func remaining_local(arrive: float, t: float, k: float, until: float) -> float:
+	if k == 1.0 or until <= t:
+		return maxf(arrive - t, 0.0)
+	if arrive <= until:
+		return maxf(arrive - t, 0.0) * k
+	return (until - t) * k + (arrive - until)
+
+
+## ⚡ Ciclo global en que llega lo que le queda (`left`, ciclos del nodo) saliendo de `t` con el
+## ritmo `(k, until)`. Sin boost es `t + left`, bit a bit lo de siempre. La inversa de
+## `remaining_local`: el boost que expira a mitad de viaje ya va contado aquí, así que expirar no
+## recalcula nada.
+static func arrival(t: float, left: float, k: float, until: float) -> float:
+	if k == 1.0 or until <= t:
+		return t + left
+	var boosted := (until - t) * k
+	if left <= boosted:
+		return t + left / k
+	return until + (left - boosted)
 
 
 func to_dict() -> Dictionary:

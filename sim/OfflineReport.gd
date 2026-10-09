@@ -28,6 +28,9 @@ var idle_nodes: PackedStringArray = PackedStringArray()
 ## Rendimiento de un nodo delegado, para poder citarlo sin repetir el número a mano. Lo pone
 ## `build` con el que aplica la simulación (`SimEngine.governor_efficiency`), legado incluido.
 var governor_efficiency: float = 0.85
+## Si se podía delegar (🎖️ Consejo, `Ascension.governor_open`). Sin él, `idle_nodes` se sigue
+## contando pero la línea no se escribe: no se reprocha no hacer algo que todavía no se puede.
+var governor_open: bool = true
 
 
 ## Foto del estado, para poder comparar después.
@@ -63,6 +66,7 @@ static func build(
 	# Se recibe hecho, no se calcula aquí: el informe no sabe del legado, y una segunda cuenta
 	# del peaje es justo lo que hacía que la UI enseñase un número distinto del aplicado.
 	report.governor_efficiency = efficiency
+	report.governor_open = Ascension.governor_open(state)
 	report.pop_before = float(before["pop"])
 	report.pop_after = state.root().total_pop if state.root() != null else 0.0
 
@@ -118,7 +122,7 @@ func lines() -> PackedStringArray:
 		out.append("🚩 Han llegado %d expediciones: nacen %s." % [
 			colonies_arrived.size(), ", ".join(colonies_arrived)])
 
-	if not idle_nodes.is_empty():
+	if not idle_nodes.is_empty() and governor_open:
 		out.append("")
 		out.append("⏸️ %s ha estado parado en su techo mientras no mirabas." % \
 			", ".join(idle_nodes) if idle_nodes.size() == 1

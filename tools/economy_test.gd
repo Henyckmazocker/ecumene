@@ -58,6 +58,24 @@ func _init() -> void:
 	failures += _the_second_acceleration_costs_more()
 	failures += _no_gold_no_acceleration()
 	failures += _a_town_cannot_accelerate()
+	# 🛒 Objetos de tiempo (M3): el ⌛ es tiempo online, se paga del nodo enfocado, «en todos» pide
+	# uno por nodo y el ⚡ no se apila.
+	failures += _skip_equals_ticking()
+	failures += _buy_pays_from_focused_node()
+	failures += _use_all_needs_one_per_node()
+	failures += _boost_does_not_stack()
+	# ⌛ Goteo (M4 de Objetos de tiempo): tope de 3 goteados, y los comprados no lo tapan.
+	failures += _drip_caps_at_three()
+	failures += _bought_skips_dont_block_drip()
+	# 🎖️ Gobernador por sello (M2): sin Consejo no se delega, con Consejo hace falta un sello por
+	# nodo, sellar delega y lo que funda un gobernador nace sellado.
+	failures += _no_council_no_delegate()
+	failures += _council_needs_seal()
+	failures += _seal_all_needs_one_per_unsealed()
+	failures += _governor_colonies_born_sealed()
+	failures += _seal_delegates()
+	failures += _found_and_delegate_spends_seal()
+	failures += _found_and_delegate_without_seal_is_manual()
 	TestUtil.finish(self, failures)
 
 
@@ -2289,4 +2307,486 @@ func _a_town_cannot_accelerate() -> int:
 			and e.arrive_cycle == arrive and root.stocks[Goods.GOLD] == 1.0e9,
 		"⏩ un pueblo no acelera ni con oro de sobra: «%s»" % blocker,
 		"⏩ un pueblo acelera, o el motivo es «%s»" % blocker
+	)
+
+
+## **⌛ Un `skip_1h` es una hora jugada a ▶**: sale del inventario, el motor lo trocea como una
+## ausencia (`begin_skip`, sin tope y a eficiencia 1) y avanza por `tick` como siempre. Frente a
+## 3.600 `tick(1)` da el mismo reloj, los mismos edificios y oficios, el mismo inventario y la
+## misma población y almacenes **al error del integrador** (la tolerancia de `offline_test`):
+## sin nada delegado ni rutas el salto va de un `tick(3600)`, y N×1 frente a N solo es exacto en
+## aritmética real. Si además el `state_hash` sale idéntico, mejor; el test lo dice.
+func _skip_equals_ticking() -> int:
+	var skip := TestUtil.make_engine(5150)
+	var ticked := TestUtil.make_engine(5150)
+	for e in [skip, ticked]:
+		Shop.grant(e.state, "skip_1h", 1, null, "test")
+	var blocker := skip.skip_blocker("skip_1h")
+	var job := skip.use_skip("skip_1h")
+	var started := job != null and job.is_skip and job.cycles == 3600.0
+	# Durante el salto no se puede usar otro: hay una acreditación a medias.
+	Shop.grant(skip.state, "skip_15m", 1, null, "test")
+	var busy := skip.skip_blocker("skip_15m")
+	while job != null and not skip.advance_catch_up(job, 0.0):
+		pass
+	Shop.grant(ticked.state, "skip_15m", 1, null, "test")
+	# El de tickear gasta su ⌛ por la misma ruta, sin avanzar nada, para que el inventario cuadre.
+	var spent := Shop.spend_skip(ticked.state, ticked.state.root(), "skip_1h", null)
+	for _i in 3600:
+		ticked.tick(1.0)
+
+	var a := skip.state.root()
+	var b := ticked.state.root()
+	var worst := TestUtil.rel_error(a.pop, b.pop)
+	for i in Goods.COUNT:
+		worst = maxf(worst, TestUtil.rel_error(a.stocks[i], b.stocks[i]))
+	var same_shape := skip.state.cycle == ticked.state.cycle and skip.state.cycle == 3600.0 \
+		and a.buildings == b.buildings and a.jobs == b.jobs \
+		and Shop.count_of(skip.state, "skip_1h") == 0 \
+		and skip.state.items == ticked.state.items and spent == 3600.0
+	var same_hash := skip.state.state_hash() == ticked.state.state_hash()
+	var failures := TestUtil.check(
+		blocker.is_empty() and started and same_shape and worst <= 1.0e-6
+			and skip.last_offline == null,
+		"⌛ un skip_1h da lo mismo que 3.600 tick(1): ciclo %.0f, error máx. %s, hash %s, sin informe de vuelta"
+			% [skip.state.cycle, TestUtil.sci(worst), "idéntico" if same_hash else "distinto al ulp"],
+		"⌛ el salto no cuadra con tickear: blocker «%s», empezado %s, forma igual %s, error %s, informe %s"
+			% [blocker, started, same_shape, TestUtil.sci(worst), skip.last_offline != null]
+	)
+	failures += TestUtil.check(
+		busy == "espera a que termine la acreditación",
+		"⌛ con un salto a medias, otro dice «%s»" % busy,
+		"⌛ con un salto a medias, otro dice «%s»" % busy
+	)
+	# Sin ⌛ en el inventario no hay salto, ni se mueve el reloj.
+	var cycle := skip.state.cycle
+	failures += TestUtil.check(
+		skip.skip_blocker("skip_4h") == "faltan 1 ⌛" and skip.use_skip("skip_4h") == null
+			and skip.state.cycle == cycle,
+		"⌛ sin el objeto no se salta: «faltan 1 ⌛»",
+		"⌛ se salta sin tener el objeto, o el motivo es «%s»" % skip.skip_blocker("skip_4h")
+	)
+	return failures
+
+
+## **🛒 Se paga del almacén del nodo enfocado**, con 🪙 o con 📜, el precio entero en uno de los
+## dos; los demás nodos no ponen nada. Sin bastante, `buy_blocker` dice cuánto falta y no se cobra.
+func _buy_pays_from_focused_node() -> int:
+	var engine := TestUtil.make_engine(6160)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.TOWN
+	root.pop = 500.0
+	root.stocks[Goods.FOOD] = 500.0
+	var child := TestUtil.found_now(state, root, engine.params)
+	engine.events.enabled = true
+	var def := Items.get_def("boost_x2")
+	root.stocks[Goods.GOLD] = 1000.0
+	child.stocks[Goods.GOLD] = def.price[Goods.GOLD] + 7.0
+	child.stocks[Goods.CULTURE] = def.price[Goods.CULTURE] - 0.5
+	var ok := Shop.buy(state, child, "boost_x2", Goods.GOLD, engine.events)
+	var last: Dictionary = engine.events.entries.back() if not engine.events.entries.is_empty() else {}
+	var failures := TestUtil.check(
+		ok and child.stocks[Goods.GOLD] == 7.0 and root.stocks[Goods.GOLD] == 1000.0
+			and Shop.count_of(state, "boost_x2") == 1
+			and last.get("category") == SimEventLog.ITEM_BOUGHT
+			and last.get("node") == child.id and last["data"].get("good") == "gold"
+			and last["data"].get("price") == def.price[Goods.GOLD],
+		"🛒 ⚡ comprado con %.0f 🪙 del nodo enfocado, y el padre no pone nada" % def.price[Goods.GOLD],
+		"🛒 la compra no paga del nodo enfocado: ok %s, 🪙 hijo %.1f, 🪙 raíz %.1f, inventario %d, evento %s"
+			% [ok, child.stocks[Goods.GOLD], root.stocks[Goods.GOLD],
+				Shop.count_of(state, "boost_x2"), last]
+	)
+	# Con 📜 le falta medio: «faltan 1 📜» y nada se mueve.
+	var blocker := Shop.buy_blocker(state, child, "boost_x2", Goods.CULTURE)
+	var culture := child.stocks[Goods.CULTURE]
+	failures += TestUtil.check(
+		blocker == "faltan 1 📜"
+			and not Shop.buy(state, child, "boost_x2", Goods.CULTURE, engine.events)
+			and child.stocks[Goods.CULTURE] == culture and Shop.count_of(state, "boost_x2") == 1,
+		"🛒 sin 📜 bastante no se compra: «%s»" % blocker,
+		"🛒 se compra sin 📜, o el motivo es «%s»" % blocker
+	)
+	# Con madera no se paga nada, y el 🎖️ se compra pero no se usa.
+	child.stocks[Goods.GOLD] = Items.get_def("seal").price[Goods.GOLD]
+	var sealed := Shop.buy(state, child, "seal", Goods.GOLD, engine.events)
+	failures += TestUtil.check(
+		Shop.buy_blocker(state, child, "skip_1h", Goods.WOOD) == "no se paga con 🪵"
+			and sealed and Shop.count_of(state, "seal") == 1
+			and Shop.use_blocker(state, child, "seal", false) == "se desbloquea con 🎖️ Consejo",
+		"🛒 la madera no paga, y el 🎖️ se compra pero «se desbloquea con 🎖️ Consejo»",
+		"🛒 la madera paga, o el 🎖️ no se compra o se puede usar"
+	)
+	return failures
+
+
+## **«En todos» es uno por nodo, o nada.** Con tres nodos en el subárbol y dos ⚡, `use_blocker`
+## dice «faltan 1 ⚡» y no se gasta ninguno ni se acelera nadie; con el tercero, los tres a ×2 y el
+## inventario vacío.
+func _use_all_needs_one_per_node() -> int:
+	var engine := TestUtil.make_engine(7170)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.CITY
+	root.pop = 2000.0
+	root.stocks[Goods.FOOD] = 5000.0
+	TestUtil.found_now(state, root, engine.params)
+	root.pop = 2000.0
+	root.stocks[Goods.FOOD] = 5000.0
+	TestUtil.found_now(state, root, engine.params)
+	var nodes := Shop.targets(state, root, true)
+	Shop.grant(state, "boost_x2", 2, null, "test")
+	var blocker := Shop.use_blocker(state, root, "boost_x2", true)
+	var used := Shop.use_boost(state, root, "boost_x2", true, engine.events)
+	var untouched := true
+	for n in nodes:
+		untouched = untouched and n.boost_factor == 1.0
+	var failures := TestUtil.check(
+		nodes.size() == 3 and blocker == "faltan 1 ⚡" and used == 0 and untouched
+			and Shop.count_of(state, "boost_x2") == 2 and state.min_boost_until == INF,
+		"⚡ en todos con 3 nodos y 2 ⚡: «%s», y no se gasta nada" % blocker,
+		"⚡ en todos con %d nodos y 2 ⚡: «%s», usados %d, quedan %d" % [
+			nodes.size(), blocker, used, Shop.count_of(state, "boost_x2")]
+	)
+	Shop.grant(state, "boost_x2", 1, null, "test")
+	used = Shop.use_boost(state, root, "boost_x2", true, engine.events)
+	var all_boosted := true
+	for n in nodes:
+		all_boosted = all_boosted and n.boost_factor == 2.0 and n.boost_until == state.cycle + 600.0
+	var ordered := nodes[0].id < nodes[1].id and nodes[1].id < nodes[2].id
+	failures += TestUtil.check(
+		used == 3 and all_boosted and ordered and Shop.count_of(state, "boost_x2") == 0
+			and state.items.is_empty() and state.min_boost_until == state.cycle + 600.0,
+		"⚡ con el tercero, los 3 nodos a ×2 en orden de id y el inventario vacío",
+		"⚡ en todos con 3: usados %d, todos a ×2 %s, en orden %s, quedan %d" % [
+			used, all_boosted, ordered, Shop.count_of(state, "boost_x2")]
+	)
+	return failures
+
+
+## **El ⚡ no se apila**: un ×2 sobre un ×4 deja el ×4 y renueva la duración desde ahora; un ×4
+## sobre un ×2 sube a ×4. Cada uso gasta su objeto igual.
+func _boost_does_not_stack() -> int:
+	var engine := TestUtil.make_engine(8180)
+	var state := engine.state
+	var root := state.root()
+	Shop.grant(state, "boost_x4", 1, null, "test")
+	Shop.grant(state, "boost_x2", 2, null, "test")
+	Shop.use_boost(state, root, "boost_x4", false, engine.events)
+	engine.tick(100.0)
+	Shop.use_boost(state, root, "boost_x2", false, engine.events)
+	var kept := root.boost_factor == 4.0 and root.boost_until == 700.0
+	var fresh := TestUtil.make_engine(8181)
+	var other := fresh.state.root()
+	Shop.grant(fresh.state, "boost_x4", 1, null, "test")
+	Shop.grant(fresh.state, "boost_x2", 1, null, "test")
+	Shop.use_boost(fresh.state, other, "boost_x2", false, null)
+	fresh.tick(50.0)
+	Shop.use_boost(fresh.state, other, "boost_x4", false, null)
+	var raised := other.boost_factor == 4.0 and other.boost_until == 650.0
+	return TestUtil.check(
+		kept and raised and Shop.count_of(state, "boost_x2") == 1
+			and Shop.count_of(fresh.state, "boost_x4") == 0,
+		"⚡ no se apila: ×2 sobre ×4 se queda en ×4 hasta el ciclo 700, ×4 sobre ×2 sube a ×4 hasta el 650",
+		"⚡ se apila o no renueva: ×%.0f hasta %.1f, ×%.0f hasta %.1f" % [
+			root.boost_factor, root.boost_until, other.boost_factor, other.boost_until]
+	)
+
+
+## **⌛ El goteo se para en 3.** Cinco intervalos de un tirón (`tick` de 18.000, que cruza los cinco
+## en el `while` de `Shop.drip`) dejan 3 ⌛ y `drip_cycle` en el quinto: el reloj del goteo corre
+## aunque el tope esté lleno, así que un ⌛ largo no se autoalimenta. Cada goteo se anota como
+## `item_dripped` con el actor `system`. Gastar uno abre hueco y el siguiente intervalo lo rellena.
+func _drip_caps_at_three() -> int:
+	var engine := TestUtil.make_engine(8180)
+	var state := engine.state
+	var p := engine.params
+	engine.events.enabled = true
+	engine.tick(5.0 * p.drip_interval)
+	var dripped := 0
+	var by_system := true
+	for e in engine.events.entries:
+		if e.get("category") == SimEventLog.ITEM_DRIPPED:
+			dripped += 1
+			by_system = by_system and e.get("actor") == "system"
+	var failures := TestUtil.check(
+		Shop.count_of(state, "skip_15m") == p.drip_cap and state.drip_held == p.drip_cap
+			and state.drip_cycle == 5.0 * p.drip_interval and dripped == p.drip_cap and by_system,
+		"⌛ goteo: 5 intervalos de un tirón dejan %d ⌛ (tope), `drip_cycle` %.0f y %d `item_dripped`" % [
+			Shop.count_of(state, "skip_15m"), state.drip_cycle, dripped,
+		],
+		"⌛ el goteo no se para en %d: ⌛ %d, goteados %d, `drip_cycle` %.1f, eventos %d (system %s)" % [
+			p.drip_cap, Shop.count_of(state, "skip_15m"), state.drip_held, state.drip_cycle, dripped,
+			by_system,
+		]
+	)
+	var cycles := Shop.spend_skip(state, state.root(), "skip_15m", engine.events)
+	engine.tick(p.drip_interval - 1.0)
+	var before := Shop.count_of(state, "skip_15m")
+	engine.tick(1.0)
+	failures += TestUtil.check(
+		cycles > 0.0 and before == p.drip_cap - 1 and Shop.count_of(state, "skip_15m") == p.drip_cap
+			and state.drip_held == p.drip_cap,
+		"⌛ gastar uno abre hueco, y cae otro justo al cumplirse el intervalo",
+		"⌛ tras gastar uno: %.0f ciclos, ⌛ %d antes del intervalo y %d después, goteados %d" % [
+			cycles, before, Shop.count_of(state, "skip_15m"), state.drip_held,
+		]
+	)
+	return failures
+
+
+## **⌛ Comprar no apaga el goteo.** Con 5 `skip_15m` comprados en el inventario, el tope solo mira
+## `drip_held`: siguen cayendo hasta 3 goteados (8 en total). Y usar uno gasta antes de lo
+## goteado, para que el goteo vuelva a correr cuanto antes.
+func _bought_skips_dont_block_drip() -> int:
+	var engine := TestUtil.make_engine(9190)
+	var state := engine.state
+	var p := engine.params
+	var root := state.root()
+	var price := Items.get_def("skip_15m").price[Goods.GOLD]
+	root.stocks[Goods.GOLD] = 5.0 * price
+	var bought := 0
+	for _i in 5:
+		if Shop.buy(state, root, "skip_15m", Goods.GOLD, engine.events):
+			bought += 1
+	engine.tick(4.0 * p.drip_interval)
+	var failures := TestUtil.check(
+		bought == 5 and Shop.count_of(state, "skip_15m") == 5 + p.drip_cap
+			and state.drip_held == p.drip_cap,
+		"⌛ con 5 comprados siguen goteando %d: %d en el inventario" % [
+			state.drip_held, Shop.count_of(state, "skip_15m"),
+		],
+		"⌛ lo comprado tapa el goteo: comprados %d, ⌛ %d, goteados %d" % [
+			bought, Shop.count_of(state, "skip_15m"), state.drip_held,
+		]
+	)
+	Shop.spend_skip(state, root, "skip_15m", engine.events)
+	engine.tick(p.drip_interval)
+	failures += TestUtil.check(
+		Shop.count_of(state, "skip_15m") == 5 + p.drip_cap and state.drip_held == p.drip_cap,
+		"⌛ usar uno gasta lo goteado, y el goteo lo repone aunque queden 5 comprados",
+		"⌛ usar uno con comprados: ⌛ %d, goteados %d" % [
+			Shop.count_of(state, "skip_15m"), state.drip_held,
+		]
+	)
+	return failures
+
+
+## Un pueblo que puede fundar ya, con 🎖️ Consejo comprado si `council`.
+func _seal_engine(seed_value: int, council := true) -> SimEngine:
+	var engine := TestUtil.make_engine(seed_value)
+	var root := engine.state.root()
+	root.tier = Content.TOWN
+	root.pop = 500.0
+	root.stocks[Goods.FOOD] = 500.0
+	engine.state.refresh_totals()
+	if council:
+		engine.state.legacy_nodes = PackedStringArray(["council"])
+	return engine
+
+
+## Hace llegar la expedición en camino de `node` en el acto, como `TestUtil.found_now`.
+func _arrive_now(state: WorldState, node: SimNode, events: SimEventLog) -> SimNode:
+	var e := state.expedition_of(node.id)
+	if e == null:
+		return null
+	state.cancel_expedition_of(node.id)
+	return Promotion.arrive(state, e, events)
+
+
+## **Sin 🎖️ Consejo no se delega**: ni con el nodo sellado, ni usando un 🎖️, ni con «Fundar y
+## delegar», que no lanza nada. La primitiva sigue sin puerta: es el proxy de tests y `era_probe`.
+func _no_council_no_delegate() -> int:
+	var engine := _seal_engine(9100, false)
+	var state := engine.state
+	var root := state.root()
+	Shop.grant(state, "seal", 1, null, "test")
+	var sealed_blocker := ""
+	root.governor_unlocked = true
+	sealed_blocker = GovernorSys.delegate_blocker(state, root)
+	root.governor_unlocked = false
+	var blocker := GovernorSys.delegate_blocker(state, root)
+	var use := Shop.use_blocker(state, root, "seal", false)
+	var used := Shop.use_seal(state, root, false, engine.events)
+	var sent := Shop.found_and_delegate(state, root, engine.params, engine.events)
+	var failures := TestUtil.check(
+		blocker == "se desbloquea con 🎖️ Consejo, en el legado" and sealed_blocker == blocker
+			and use == GovernorSys.NEEDS_COUNCIL and used == 0 and sent == null
+			and state.expeditions.is_empty() and not root.is_delegated()
+			and not root.governor_unlocked and Shop.count_of(state, "seal") == 1,
+		"🎖️ sin Consejo no se delega: «%s», ni sellando ni fundando y delegando" % blocker,
+		"🎖️ sin Consejo: «%s» / sellado «%s» / usar «%s», sellados %d, expedición %s, delegado %s, quedan %d" % [
+			blocker, sealed_blocker, use, used, sent != null, root.is_delegated(),
+			Shop.count_of(state, "seal")]
+	)
+	GovernorSys.delegate(state, root, Governor.balanced())
+	failures += TestUtil.check(
+		root.is_delegated() and not root.governor_unlocked,
+		"y la primitiva `GovernorSys.delegate` sigue sin puerta (el proxy)",
+		"la primitiva se ha contaminado con la puerta"
+	)
+	return failures
+
+
+## **Con 🎖️ Consejo, hace falta un sello por nodo**, y es permanente: retomar el mando no lo quita y
+## volver a delegar no gasta otro.
+func _council_needs_seal() -> int:
+	var engine := _seal_engine(9110)
+	var state := engine.state
+	var root := state.root()
+	var before := GovernorSys.delegate_blocker(state, root)
+	Shop.grant(state, "seal", 1, null, "test")
+	Shop.use_seal(state, root, false, engine.events)
+	var after := GovernorSys.delegate_blocker(state, root)
+	root.governor = null
+	var retaken := GovernorSys.delegate_blocker(state, root)
+	var again := Shop.use_blocker(state, root, "seal", false)
+	return TestUtil.check(
+		before == "hace falta un 🎖️ Sello" and after == "" and retaken == ""
+			and root.governor_unlocked and again == "ya está sellado"
+			and Shop.count_of(state, "seal") == 0,
+		"🎖️ con Consejo y sin sello: «%s»; sellado se delega, y retomado el mando se vuelve a delegar gratis" % before,
+		"🎖️ con Consejo: antes «%s», sellado «%s», retomado «%s», volver a sellar «%s», quedan %d" % [
+			before, after, retaken, again, Shop.count_of(state, "seal")]
+	)
+
+
+## **«En todos» sella solo lo que no está sellado**, uno por nodo y todo o nada.
+func _seal_all_needs_one_per_unsealed() -> int:
+	var engine := _seal_engine(9120)
+	var state := engine.state
+	var root := state.root()
+	root.tier = Content.CITY
+	root.pop = 2000.0
+	root.stocks[Goods.FOOD] = 5000.0
+	var a := TestUtil.found_now(state, root, engine.params)
+	root.pop = 2000.0
+	root.stocks[Goods.FOOD] = 5000.0
+	var b := TestUtil.found_now(state, root, engine.params)
+	Shop.grant(state, "seal", 1, null, "test")
+	Shop.use_seal(state, a, false, engine.events)
+	Shop.grant(state, "seal", 1, null, "test")
+	var short := Shop.use_blocker(state, root, "seal", true)
+	var used := Shop.use_seal(state, root, true, engine.events)
+	var failures := TestUtil.check(
+		a != null and b != null and short == "faltan 1 🎖️" and used == 0
+			and not root.is_delegated() and not b.is_delegated()
+			and Shop.count_of(state, "seal") == 1,
+		"🎖️ en todos con 2 sin sellar y 1 🎖️: «%s», y no se gasta nada" % short,
+		"🎖️ en todos con 2 sin sellar y 1 🎖️: «%s», sellados %d, quedan %d" % [
+			short, used, Shop.count_of(state, "seal")]
+	)
+	Shop.grant(state, "seal", 1, null, "test")
+	used = Shop.use_seal(state, root, true, engine.events)
+	var all_sealed := true
+	for n in Shop.targets(state, root, true):
+		all_sealed = all_sealed and n.governor_unlocked and n.is_delegated()
+	failures += TestUtil.check(
+		used == 2 and all_sealed and Shop.count_of(state, "seal") == 0
+			and Shop.use_blocker(state, root, "seal", true) == "ya están todos sellados",
+		"🎖️ con el segundo, los 3 nodos sellados y delegados, y el inventario vacío",
+		"🎖️ en todos con 2: sellados %d, todos sellados y delegados %s, quedan %d" % [
+			used, all_sealed, Shop.count_of(state, "seal")]
+	)
+	return failures
+
+
+## **Lo que funda un gobernador nace sellado y delegado, gratis**, aunque a él lo haya puesto la
+## primitiva sin sello ni Consejo: es la herencia sin la que 👑 Dinastía no tendría árbol.
+func _governor_colonies_born_sealed() -> int:
+	var hut := Content.building_index("hut")
+	var engine := TestUtil.make_engine(9130)
+	var state := engine.state
+	var node := state.root()
+	node.tier = Content.TOWN
+	node.buildings[hut] = 20
+	node.buildings[Content.building_index("farm")] = 8
+	node.pop = 60.0
+	for i in Goods.COUNT:
+		node.stocks[i] = 400.0
+	var g := Governor.balanced()
+	g.may_promote = false
+	GovernorSys.delegate(state, node, g)
+	for _i in 200:
+		engine.tick(25.0)
+	var unsealed := PackedStringArray()
+	for id in node.children:
+		var child: SimNode = state.nodes.get(id)
+		if child != null and not (child.governor_unlocked and child.is_delegated()):
+			unsealed.append(child.name)
+	return TestUtil.check(
+		not node.children.is_empty() and unsealed.is_empty() and not node.governor_unlocked
+			and Shop.count_of(state, "seal") == 0,
+		"🎖️ las %d colonias de un gobernador nacen selladas y delegadas, sin gastar nada" % node.children.size(),
+		"🎖️ colonias de un gobernador: %d fundadas, sin sello %s" % [node.children.size(), unsealed]
+	)
+
+
+## **Sellar delega en el acto**, con `Governor.balanced()` y el reloj de checkpoints arrancando
+## ahora, y lo cuenta como `governor {delegated: true}` además del `item_used`.
+func _seal_delegates() -> int:
+	var engine := _seal_engine(9140)
+	var state := engine.state
+	var root := state.root()
+	engine.events.enabled = true
+	engine.tick(300.0)
+	Shop.grant(state, "seal", 1, null, "test")
+	var used := Shop.use_seal(state, root, false, engine.events)
+	var kinds := PackedStringArray()
+	for entry in engine.events.recent(2):
+		kinds.append(String(entry["category"]))
+	return TestUtil.check(
+		used == 1 and root.governor_unlocked and root.is_delegated()
+			and root.governor_last_cycle == GovernorSys.clock_of(state, root)
+			and root.governor_last_cycle == 300.0
+			and kinds == PackedStringArray(["governor", SimEventLog.ITEM_USED]),
+		"🎖️ sellar delega en el acto, con el reloj del gobernador en el ciclo %.0f y eventos %s" % [
+			root.governor_last_cycle, kinds],
+		"🎖️ sellar: usados %d, sellado %s, delegado %s, reloj %.0f, eventos %s" % [
+			used, root.governor_unlocked, root.is_delegated(), root.governor_last_cycle, kinds]
+	)
+
+
+## **«🚩🎖️ Fundar y delegar» con un 🎖️ lo gasta al salir**, y no si la expedición no sale. La colonia
+## nace sellada y delegada.
+func _found_and_delegate_spends_seal() -> int:
+	var engine := _seal_engine(9150)
+	var state := engine.state
+	var root := state.root()
+	Shop.grant(state, "seal", 1, null, "test")
+	root.pop = 10.0
+	var refused := Shop.found_and_delegate(state, root, engine.params, engine.events)
+	var kept := Shop.count_of(state, "seal")
+	root.pop = 500.0
+	var sent := Shop.found_and_delegate(state, root, engine.params, engine.events)
+	var spent := Shop.count_of(state, "seal")
+	var child := _arrive_now(state, root, engine.events)
+	return TestUtil.check(
+		refused == null and kept == 1 and sent != null and sent.delegate_policy != null
+			and spent == 0 and child != null and child.governor_unlocked and child.is_delegated(),
+		"🚩🎖️ con un 🎖️: rechazada no lo gasta, al salir sí, y la colonia nace sellada y delegada",
+		"🚩🎖️ con un 🎖️: rechazada %s (quedan %d), sale %s (quedan %d), hijo sellado %s delegado %s" % [
+			refused != null, kept, sent != null, spent,
+			child != null and child.governor_unlocked, child != null and child.is_delegated()]
+	)
+
+
+## **«🚩🎖️ Fundar y delegar» sin sellos funda a mano**: el hijo nace sin gobernador ni sello, y al
+## sellarlo queda delegado.
+func _found_and_delegate_without_seal_is_manual() -> int:
+	var engine := _seal_engine(9160)
+	var state := engine.state
+	var root := state.root()
+	var sent := Shop.found_and_delegate(state, root, engine.params, engine.events)
+	var child := _arrive_now(state, root, engine.events)
+	var manual := child != null and not child.is_delegated() and not child.governor_unlocked
+	Shop.grant(state, "seal", 1, null, "test")
+	var used := Shop.use_seal(state, child, false, engine.events) if child != null else 0
+	return TestUtil.check(
+		sent != null and sent.delegate_policy == null and manual and used == 1
+			and child.governor_unlocked and child.is_delegated()
+			and Shop.count_of(state, "seal") == 0,
+		"🚩🎖️ sin sellos funda a mano, y al sellar el hijo queda delegado",
+		"🚩🎖️ sin sellos: sale %s con política %s, a mano %s, sellados %d" % [
+			sent != null, sent != null and sent.delegate_policy != null, manual, used]
 	)

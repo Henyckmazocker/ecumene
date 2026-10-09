@@ -70,16 +70,18 @@ Antes de tocar diseño o balance, lee esa página y `Ecumene/Programación.md`.
 main/       Main.tscn/gd — arranque, carga, autoguardado
 sim/        Goods, WorldState, SimEngine, Integrator, SimEventLog, NameGen, SimParams
             node/     SimNode, TierDef, BuildingDef, Governor, Route, Expedition
-            systems/  Construction, Promotion, GovernorSys, Ascension, Upgrading, Logistics  (estáticos y puros)
+            systems/  Construction, Promotion, GovernorSys, Ascension, Upgrading, Logistics, Shop  (estáticos y puros)
 world/      Relief (tierra y agua), TerrainGen, Layout — terreno procedural y colocación
 view/       SettlementView + crowd/ (Villager, Crowd, CrowdReconciler, DayClock, Places)
 camera/     ScaleCamera — paneo y zoom, ratón y dedos; el zoom es profundidad y cruza de escala
 ui/         HUD — recursos con tasa, población de dos marcas, oficios, construcción, y la
-            consola del gobernador (prioridades, permisos y orden) dentro de la pestaña de oficios
+            consola del gobernador (prioridades, permisos y orden) dentro de la pestaña de oficios,
+            y la 🛒 tienda de objetos (sexta pestaña)
             UpgradeTreeView — árbol de progresión genérico (mejoras y legado)
 data/       Content (catálogo de escalas y edificios), Upgrades (árbol de mejoras),
-            Legacy (árbol de ascensión)
+            Legacy (árbol de ascensión), Items (catálogo de objetos de tiempo)
 platform/   Save — user:// + volcado a IndexedDB en web
+            DevMode — ×2/×4/×8 solo en el editor o con `--dev` (`--no-dev` lo apaga)
             Analytics — autoload, el primero del proyecto: clave, canal y consentimiento, y el
             único que habla con Augur
 addons/     augur/ — SDK de Augur (autoload `Augur`), copiado con su install.sh; no se edita aquí,
@@ -100,8 +102,11 @@ tools/      tests headless + run_tests.sh + export.sh + gen_sprites, layout_dump
 godot-4 --headless --path . -s res://tools/offline_test.gd      # el test que sostiene todo
 godot-4 --headless --path . -s res://tools/era_probe.gd         # la curva de la era hasta Región, hito a hito y era 2 (~13 s/semilla)
 godot-4 --headless --path . -s res://tools/era_probe.gd -- --until=h3   # solo hasta Ciudad, lo que vigila la suite (~1 s/semilla)
+godot-4 --headless --path . -s res://tools/era_probe.gd -- --no-proxy   # era 2 delegando solo la raíz sellada con Consejo: ≤ 0,85 a Ciudad (hoy 0,845; fuera de la suite)
 godot-4 --path . -- --shot=user://h10.png --shot-cycles=1800 --shot-governor --shot-hour=10
 godot-4 --path . -- --shot=user://leg.png --shot-cycles=600 --shot-legacy=40 --shot-tab=4
+godot-4 --path . -- --shot=user://tienda.png --shot-cycles=4500 --shot-governor --shot-tab=5   # 🛒; --shot-boost=x2 enseña el ⚡ en 📊
+godot-4 --path . -- --no-dev                                     # jugar como la build de release: solo ⏸ y ▶
 godot-4 --path . -- --shot=user://foco.png --shot-cycles=4500 --shot-governor --shot-focus-child=0 --shot-tab=0   # hace falta un hijo llegado
 godot-4 --path . -- --shot=user://vista.png --shot-cycles=48000 --shot-governor --shot-depth=2.9 --shot-tab=0  # vista agregada: ciudad, pueblos y expedición
 godot-4 --path . -- --shot=user://fundido.png --shot-cycles=20000 --shot-governor --shot-focus-child=0 --shot-fade=0.5   # a mitad del cruce
@@ -160,6 +165,7 @@ Los invariantes que cubren:
 | Un punto por cada varios habitantes, y lo dibujado no se desborda por mucho que la población se meza | `crowd_test.gd` |
 | La economía tiene equilibrio, y también sabe colapsar | `economy_test.gd` |
 | Sin delegar no se destina, ni se compra ni se investiga nada solo | `economy_test.gd` |
+| Sin 🎖️ Consejo y sin sello no se delega; sellar delega, y lo que funda un gobernador nace sellado. La primitiva `GovernorSys.delegate` no tiene puerta: es el proxy de los tests | `economy_test.gd`, `legacy_test.gd`, `save_test.gd` |
 | Delegando sí: reparte por todos los oficios, mira el consumo, investiga y asciende | `economy_test.gd` |
 | Y solo hasta donde se le deja: sin permiso no construye, ni investiga, ni asciende — pero reparte igual | `economy_test.gd` |
 | Cambiar las prioridades cambia el reparto de verdad | `economy_test.gd` |
@@ -197,3 +203,7 @@ Los invariantes que cubren:
 | Fundar es una expedición: una por nodo, y el hijo nace al llegar | `economy_test.gd`, `save_test.gd` |
 | La analítica observa y no escribe: mismo `state_hash` con o sin rastro, autoría correcta, el rastro no entra en el diario | `analytics_test.gd` |
 | El ritmo de la era: primer hijo en 2.400-5.400 ciclos, Ciudad en 14.400-32.400, y la era 2 llega a Pueblo en ≤ 0,95 y a Ciudad en ≤ 0,8 del tiempo de la primera | `economy_test.gd`, `legacy_test.gd` |
+| Un boost no rompe N×1 == N ni crea recursos en una ruta, y su expedición llega igual de 1 en 1 que de un salto | `offline_test.gd`, `determinism_test.gd`, `catchup_test.gd` |
+| Un ⌛ es tiempo online: da lo mismo que tickear, y troceado lo mismo que de un tirón | `economy_test.gd`, `catchup_test.gd` |
+| Los objetos y el goteo sobreviven al guardado y a la ascensión; un save v4 carga sin ellos | `save_test.gd`, `legacy_test.gd` |
+| El goteo cuenta igual online que offline, se para en 3 y los ⌛ comprados no lo frenan | `offline_test.gd`, `economy_test.gd` |

@@ -38,6 +38,13 @@ signal accelerate_requested()
 signal upgrade_requested(id: String)
 signal legacy_requested(id: String)
 signal ascension_requested()
+## 🛒 Comprar un objeto pagando con `good` (🪙 o 📜) del almacén del nodo enfocado. Lo atiende
+## `Main`, que llama a `Shop.buy`: la misma lista de condiciones (`Shop.buy_blocker`) que pinta el
+## botón.
+signal item_buy_requested(id: String, good: int)
+## 🛒 Usar un objeto del inventario: un ⚡ sobre el nodo enfocado o, con `all`, uno por nodo de su
+## subárbol (`Shop.use_boost`); un ⌛ sobre el mundo entero (`Main.use_skip`, `all` no cuenta).
+signal item_use_requested(id: String, all: bool)
 ## Enfocar otro nodo: un hijo desde la lista de «Colonias» o un ancestro desde las migas de pan.
 ## Lo atiende `Main._focus`, el mismo que enfoca la raíz al cargar.
 signal focus_requested(id: int)
@@ -65,6 +72,11 @@ const TAB_JOBS := 1
 const TAB_BUILD := 2
 const TAB_UPGRADES := 3
 const TAB_LEGACY := 4
+const TAB_SHOP := 5
+
+## El título del panel de vuelta, y el que pone mientras avanza un ⌛ (que no tiene informe).
+const WELCOME_TITLE := "🌙 Mientras no estabas"
+const SKIP_TITLE := "⌛ El mundo avanza"
 
 ## Los estados de `Upgrading` y los del widget son la misma idea contada dos veces: uno es
 ## modelo y el otro es dibujo, y por eso no se importan entre ellos.
@@ -127,9 +139,11 @@ const DOCK_WIDTH_MAX := 480.0
 const DOCK_HEIGHT_FRACTION := 0.42
 const DOCK_HEIGHT_MIN := 260.0
 const DOCK_HEIGHT_MAX := 520.0
-## Por debajo de este ancho las cinco palabras no caben y las pestañas se quedan en icono.
-## Eran cuatro y el umbral estaba en 340; con «Legado» dentro, a 384 px ya sobra una.
-const COMPACT_TABS_BELOW := 440.0
+## Por debajo de este ancho las palabras no caben y las pestañas se quedan en icono.
+## Eran cuatro y el umbral estaba en 340; con «Legado» dentro, a 384 px ya sobraba una, y se subió
+## a 440. Con «Tienda» son seis, ~85 px por pestaña: 530, por encima de `DOCK_WIDTH_MAX`. La
+## columna derecha va siempre en iconos; la hoja inferior de un móvil vertical, a lo ancho, no.
+const COMPACT_TABS_BELOW := 530.0
 
 var _dock: PanelContainer
 var _dock_style: StyleBoxFlat
@@ -192,6 +206,21 @@ var _ascension_button: Button
 var _confirm: PanelContainer
 var _confirm_body: Label
 var _ascension_warning: String = ""
+## 🛒 La pestaña de la tienda. Todo se crea una vez en `_build_shop_tab`, con el tema puesto antes
+## del `add_child`; al refrescar solo cambian `text`, `disabled`, `tooltip_text` y `visible`, y el
+## texto solo cuando cambia (`_set_text`).
+var _shop_drip: Label
+var _shop_pay: Label
+## Una por objeto, en el orden de `Items.all()`: `{id, header, gold, culture, use, all, reason}`.
+var _shop_rows: Array[Dictionary] = []
+## ⚡ en 📊 Estado: «⚡ ×2 · quedan 412 ciclos». Solo se ve con un boost activo.
+var _boost_label: Label
+## Hay una acreditación (ausencia o ⌛) a medias: `Shop.use_blocker` la recibe como `busy`. El HUD
+## lo sabe porque es quien enseña la barra (`begin_catch_up`/`end_catch_up`).
+var _busy: bool = false
+## Lo que dice la barra: «acreditando» una ausencia o «adelantando» un ⌛, y el título del panel.
+var _catch_up_verb: String = "acreditando"
+var _welcome_title: Label
 ## El modal de consentimiento y su ⚙️. **Solo existen con clave**: `enable_consent` los construye
 ## cuando `Main` sabe que `Analytics.enabled`, y sin clave se quedan en `null`.
 var _consent: PanelContainer
@@ -351,9 +380,10 @@ func _build_welcome() -> Control:
 	_welcome.add_child(box)
 
 	var title := Label.new()
-	title.text = "🌙 Mientras no estabas"
+	title.text = WELCOME_TITLE
 	title.add_theme_font_size_override("font_size", 22)
 	box.add_child(title)
+	_welcome_title = title
 
 	_catch_up_box = VBoxContainer.new()
 	_catch_up_box.add_theme_constant_override("separation", 8)
@@ -630,14 +660,19 @@ func show_offline(report: OfflineReport) -> void:
 
 ## Levanta el velo y enseña la barra. A partir de aquí no se puede tocar la partida hasta que
 ## `end_catch_up` diga que el mundo ya está al día.
-func begin_catch_up(seconds_away: float) -> void:
+func begin_catch_up(seconds_away: float, skip := false) -> void:
+	_busy = true
+	_catch_up_verb = "adelantando" if skip else "acreditando"
+	var title := SKIP_TITLE if skip else WELCOME_TITLE
+	if _welcome_title.text != title:
+		_welcome_title.text = title
 	_veil.visible = true
 	_welcome.visible = true
 	_catch_up_box.visible = true
 	_welcome_body.visible = false
 	_welcome_button.visible = false
 	_catch_up_bar.value = 0.0
-	_catch_up_label.text = "acreditando %s" % OfflineReport.span(seconds_away)
+	_catch_up_label.text = "%s %s" % [_catch_up_verb, OfflineReport.span(seconds_away)]
 
 
 ## Mueve la barra. La **etiqueta solo se reescribe cuando cambia el entero del porcentaje**:
@@ -646,7 +681,7 @@ func begin_catch_up(seconds_away: float) -> void:
 func set_catch_up_progress(fraction: float, seconds_away: float) -> void:
 	var percent := int(clampf(fraction, 0.0, 1.0) * 100.0)
 	_catch_up_bar.value = float(percent)
-	var text := "acreditando %s · %d %%" % [OfflineReport.span(seconds_away), percent]
+	var text := "%s %s · %d %%" % [_catch_up_verb, OfflineReport.span(seconds_away), percent]
 	if _catch_up_label.text != text:
 		_catch_up_label.text = text
 
@@ -654,6 +689,9 @@ func set_catch_up_progress(fraction: float, seconds_away: float) -> void:
 ## El mundo ya está al día: la barra desaparece, el velo se levanta y el mismo panel pasa a
 ## contar lo que pasó. Si no hay nada que contar, el panel se cierra y no se estorba.
 func end_catch_up(report: OfflineReport) -> void:
+	_busy = false
+	if _welcome_title.text != WELCOME_TITLE:
+		_welcome_title.text = WELCOME_TITLE
 	_veil.visible = false
 	_catch_up_box.visible = false
 	_welcome_body.visible = true
@@ -699,6 +737,7 @@ func _build_dock() -> PanelContainer:
 	_tabs.add_child(_build_buildings_tab())
 	_tabs.add_child(_build_upgrades_tab())
 	_tabs.add_child(_build_legacy_tab())
+	_tabs.add_child(_build_shop_tab())
 	_set_tab_titles(true)
 
 	_feed = Label.new()
@@ -732,6 +771,7 @@ func _set_tab_titles(with_text: bool) -> void:
 		TAB_BUILD: ["🔨", "Construir"],
 		TAB_UPGRADES: ["🔬", "Mejoras"],
 		TAB_LEGACY: ["🏛️", "Legado"],
+		TAB_SHOP: ["🛒", "Tienda"],
 	}
 	for index in titles:
 		var parts: Array = titles[index]
@@ -767,6 +807,13 @@ func _build_status_tab() -> Control:
 	_pop_label.add_theme_font_size_override("font_size", 13)
 	_pop_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(_pop_label)
+
+	# ⚡ El boost activo del nodo: color y tamaño aquí, antes de entrar al árbol; luego solo texto.
+	_boost_label = Label.new()
+	_boost_label.add_theme_font_size_override("font_size", 13)
+	_boost_label.modulate = OK_COLOR
+	_boost_label.visible = false
+	box.add_child(_boost_label)
 
 	_resource_box = VBoxContainer.new()
 	_resource_box.add_theme_constant_override("separation", 2)
@@ -827,12 +874,8 @@ func _build_found_row() -> Control:
 	# entrando en ella (M4) — y lo que no se delega se queda en su granja y su leñador.
 	_found_delegate_button = Button.new()
 	_found_delegate_button.custom_minimum_size = Vector2(0, 44)
-	# Texto fijo: se pone antes de entrar al árbol y no se vuelve a tocar.
+	# Texto y consejo los pone `_refresh_found_delegate`, con la puerta del legado y los sellos.
 	_found_delegate_button.text = "🚩🎖️ Fundar y delegar"
-	_found_delegate_button.tooltip_text = (
-		"Funda igual, con el mismo coste, y la colonia nace en manos de un gobernador "
-		+ "equilibrado. Para llevarla a mano, entra en ella y pulsa 🖐️."
-	)
 	_found_delegate_button.pressed.connect(func() -> void: found_requested.emit(true))
 	_found_box.add_child(_found_delegate_button)
 
@@ -1058,7 +1101,10 @@ func _build_global_rows() -> Control:
 	rows.add_child(speeds)
 	_speeds_row = speeds
 
-	for i in ["⏸", "▶", "▶▶", "▶▶▶", "▶▶▶▶"]:
+	# Sin modo desarrollo solo ⏸ y ▶: ×2, ×4 y ×8 eran depuración. Se crean una vez y el índice
+	# de cada botón sigue siendo el de `SimParams.speeds`.
+	var labels: Array[String] = ["⏸", "▶", "▶▶", "▶▶▶", "▶▶▶▶"]
+	for i in labels.slice(0, DevMode.max_speed_index(labels.size()) + 1):
 		var b := Button.new()
 		b.text = i
 		b.custom_minimum_size = Vector2(44, 40)  # el mínimo táctil de la guía de UX
@@ -1335,6 +1381,98 @@ func _build_legacy_tab() -> Control:
 	return _scrollable(box)
 
 
+## 🛒 La tienda: arriba el goteo y con qué se paga, debajo una fila por objeto.
+##
+## Cada fila: icono, nombre y cuántos tienes; «Comprar 🪙», «Comprar 📜», «Usar aquí» y, para un
+## ⚡, «Usar en todos (N)». Un botón apagado lleva su motivo en el consejo, como «Fundar», y los
+## motivos de la fila se leen también debajo, en rojo: en móvil no hay consejo que valga.
+##
+## **Todo se crea aquí y una sola vez**, con el tema puesto antes del `add_child`: los botones
+## llevan emoji, y tocarles el tema ya en el árbol cuesta ~6 ms cada uno. El refresco solo cambia
+## `text`, `disabled`, `tooltip_text` y `visible`. Los precios no cambian: su texto es fijo.
+func _build_shop_tab() -> Control:
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 6)
+
+	_shop_drip = Label.new()
+	_shop_drip.add_theme_font_size_override("font_size", 14)
+	_shop_drip.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(_shop_drip)
+
+	_shop_pay = Label.new()
+	_shop_pay.add_theme_font_size_override("font_size", 13)
+	_shop_pay.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_shop_pay.modulate = Color(1, 1, 1, 0.75)
+	box.add_child(_shop_pay)
+
+	# El coste escondido de la cultura, dicho antes de pagar: es la raíz de la 🎭 influencia.
+	var warning := Label.new()
+	warning.add_theme_font_size_override("font_size", 12)
+	warning.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	warning.modulate = Color(1, 1, 1, 0.6)
+	warning.text = ("Pagar con 📜 baja la 🎭 influencia, que es la puerta de Región. Lo comprado "
+		+ "es de la partida, no del nodo, y sobrevive a la ascensión.")
+	box.add_child(warning)
+
+	for d in Items.all():
+		box.add_child(HSeparator.new())
+		box.add_child(_make_shop_row(d))
+	return _scrollable(box)
+
+
+func _make_shop_row(d: Items.Def) -> Control:
+	var row := VBoxContainer.new()
+	row.add_theme_constant_override("separation", 4)
+
+	var header := Label.new()
+	header.add_theme_font_size_override("font_size", 15)
+	header.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	row.add_child(header)
+
+	var about := Label.new()
+	about.add_theme_font_size_override("font_size", 12)
+	about.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	about.modulate = Color(1, 1, 1, 0.6)
+	about.text = d.description
+	row.add_child(about)
+
+	var buttons := HFlowContainer.new()
+	buttons.add_theme_constant_override("h_separation", 6)
+	buttons.add_theme_constant_override("v_separation", 6)
+	row.add_child(buttons)
+
+	var gold := _shop_button(buttons, "Comprar · %s 🪙" % _short(d.price[Goods.GOLD]))
+	gold.pressed.connect(func() -> void: item_buy_requested.emit(d.id, Goods.GOLD))
+	var culture := _shop_button(buttons, "Comprar · %s 📜" % _short(d.price[Goods.CULTURE]))
+	culture.pressed.connect(func() -> void: item_buy_requested.emit(d.id, Goods.CULTURE))
+	# Un ⌛ es del mundo entero: no hay «aquí» ni «en todos», solo «Usar».
+	var use := _shop_button(buttons, "Usar" if d.kind == Items.Kind.SKIP else "Usar aquí")
+	use.pressed.connect(func() -> void: item_use_requested.emit(d.id, false))
+	var all := _shop_button(buttons, "Usar en todos")
+	all.visible = d.kind == Items.Kind.BOOST
+	all.pressed.connect(func() -> void: item_use_requested.emit(d.id, true))
+
+	var reason := Label.new()
+	reason.add_theme_font_size_override("font_size", 12)
+	reason.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	reason.modulate = WARN_COLOR
+	row.add_child(reason)
+
+	_shop_rows.append({
+		"id": d.id, "header": header, "gold": gold, "culture": culture, "use": use, "all": all,
+		"reason": reason,
+	})
+	return row
+
+
+func _shop_button(parent: Control, text: String) -> Button:
+	var b := Button.new()
+	b.custom_minimum_size = Vector2(0, 40)
+	b.text = text
+	parent.add_child(b)
+	return b
+
+
 static func _scrollable(content: Control) -> ScrollContainer:
 	var scroll := ScrollContainer.new()
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
@@ -1416,6 +1554,89 @@ func _refresh_legacy(state: WorldState) -> void:
 	_legacy_tree.set_items(items)
 
 
+## 🛒 La tienda contra el estado de ahora. Cada motivo sale de `Shop.buy_blocker` y
+## `Shop.use_blocker`, las mismas listas que vuelven a mirar `Shop.buy`, `Shop.use_boost` y
+## `SimEngine.use_skip` antes de hacer nada. Se ve siempre, también antes de Ciudad: con los
+## botones apagados y diciendo por qué, la tienda enseña qué hará el oro cuando llegue.
+func _refresh_shop(node: SimNode, state: WorldState, params: SimParams) -> void:
+	_set_text(_shop_drip, _drip_text(state, params))
+	var pay: String
+	if node.tier < Content.CITY:
+		pay = "🪙 y 📜 salen del Mercado y el Templo: hasta Ciudad no hay con qué pagar."
+	else:
+		pay = "Pagas con el almacén de %s: %s 🪙 · %s 📜" % [
+			node.name, _short(node.stocks[Goods.GOLD]), _short(node.stocks[Goods.CULTURE]),
+		]
+	_set_text(_shop_pay, pay)
+
+	var subtree := Shop.targets(state, node, true).size()
+	for row in _shop_rows:
+		var id: String = row["id"]
+		var d := Items.get_def(id)
+		_set_text(row["header"], "%s %s · tienes %d" % [d.icon, d.name, Shop.count_of(state, id)])
+		var reasons := PackedStringArray()
+		for pair in [[row["gold"], Goods.GOLD], [row["culture"], Goods.CULTURE]]:
+			var blocker := Shop.buy_blocker(state, node, id, pair[1])
+			_shop_gate(pair[0], blocker, "Comprar uno con %s del almacén de %s" % [
+				Goods.ICONS[pair[1]], node.name])
+			if not blocker.is_empty() and not reasons.has(blocker):
+				reasons.append(blocker)
+		var use_blocker := Shop.use_blocker(state, node, id, false, _busy)
+		var use_hint := ("El mundo entero avanza %s" % OfflineReport.span(
+			d.cycles * params.seconds_per_cycle)) if d.kind == Items.Kind.SKIP \
+			else ("×%d durante %d ciclos en %s" % [int(d.factor), int(d.cycles), node.name])
+		_shop_gate(row["use"], use_blocker, use_hint)
+		if not use_blocker.is_empty():
+			reasons.append("usar: " + use_blocker)
+		var all: Button = row["all"]
+		if all.visible:
+			_set_text(all, "Usar en todos (%d)" % subtree)
+			var all_blocker := Shop.use_blocker(state, node, id, true, _busy)
+			_shop_gate(all, all_blocker,
+				"Uno por nodo: %s y todo lo que cuelga de él, %d nodos" % [node.name, subtree])
+			if not all_blocker.is_empty() and all_blocker != use_blocker:
+				reasons.append("en todos: " + all_blocker)
+		_set_text(row["reason"], " · ".join(reasons))
+		row["reason"].visible = not reasons.is_empty()
+
+
+## «⌛ siguiente en 34 min · 2/3 en reserva». Lleno, el reloj sigue corriendo y lo que caería se
+## pierde (`Shop.drip`): se dice, para que la reserva llena invite a usarla.
+static func _drip_text(state: WorldState, params: SimParams) -> String:
+	if params.drip_interval <= 0.0:
+		return ""
+	var held := "%d/%d en reserva" % [state.drip_held, params.drip_cap]
+	if state.drip_held >= params.drip_cap:
+		return "⌛ reserva llena (%s): usa uno para que vuelva a caer" % held
+	var left := maxf(params.drip_interval - (state.cycle - state.drip_cycle), 0.0)
+	return "⌛ siguiente en %s · %s" % [OfflineReport.span(left * params.seconds_per_cycle), held]
+
+
+## Apaga o enciende un botón de la tienda: el motivo de `*_blocker` en el consejo si está
+## apagado, lo que hace si no.
+static func _shop_gate(button: Button, blocker: String, hint: String) -> void:
+	_set_disabled(button, not blocker.is_empty())
+	var tip := hint if blocker.is_empty() else blocker
+	if button.tooltip_text != tip:
+		button.tooltip_text = tip
+
+
+## ⚡ en 📊 Estado: el boost del nodo enfocado y cuánto le queda, en ciclos globales.
+func _refresh_boost(node: SimNode, state: WorldState) -> void:
+	var on := node.boost_factor > 1.0 and node.boost_until > state.cycle
+	if _boost_label.visible != on:
+		_boost_label.visible = on
+	if on:
+		_set_text(_boost_label, "⚡ ×%d · quedan %d ciclos" % [
+			int(node.boost_factor), int(ceilf(node.boost_until - state.cycle))])
+
+
+## Cambiar el texto de un control rehace su shaping, y con emoji cuesta: solo si cambia.
+static func _set_text(control: Control, text: String) -> void:
+	if control.get("text") != text:
+		control.set("text", text)
+
+
 ## Los rangos, de un vistazo. Un «3/5» obliga a leer dos números y compararlos; los puntos se
 ## ven sin leerlos —hasta que son tantos que ya no caben en el nodo junto al coste, y entonces
 ## el número vuelve a ser lo legible.
@@ -1488,7 +1709,9 @@ func refresh(node: SimNode, state: WorldState, params: SimParams, snap: Integrat
 	_refresh_routes(node, state, params)
 	_refresh_upgrades(node)
 	_refresh_legacy(state)
-	_refresh_jobs(node, params)
+	_refresh_shop(node, state, params)
+	_refresh_boost(node, state)
+	_refresh_jobs(node, params, state)
 	_refresh_heirs_note(node, state)
 	_refresh_builds(node)
 	for i in _speed_buttons.size():
@@ -1630,12 +1853,41 @@ func _refresh_found(node: SimNode, state: WorldState, params: SimParams) -> void
 	var blocker := Promotion.found_child_blocker(state, node, params)
 	if blocker.is_empty() and node.is_delegated():
 		blocker = "lo lleva su gobernador: recupera el mando (🖐️) para fundar a mano"
-	# Los dos botones con el mismo blocker: fundar y delegar cuesta lo mismo que fundar.
-	_found_button.disabled = not blocker.is_empty()
-	_found_delegate_button.disabled = not blocker.is_empty()
+	# Los dos botones con el mismo blocker: fundar y delegar cuesta lo mismo que fundar. El de
+	# delegar suma la puerta del legado (`delegate_blocker`, su primer paso: el sello no se le
+	# pide, porque sin sellos funda a mano y lo dice antes de pulsar). Solo `text`, `disabled` y
+	# `tooltip_text`: está en el árbol y lleva emoji.
+	_set_disabled(_found_button, not blocker.is_empty())
+	_refresh_found_delegate(node, state, blocker)
 	_found_reason.visible = not blocker.is_empty()
 	_found_reason.text = blocker
 	_refresh_accelerate(node, state, params)
+
+
+## «🚩🎖️ Fundar y delegar» con su motivo (`Shop.found_and_delegate`). Sin 🎖️ Consejo sale 🔒 y
+## apagado; con Consejo y sin sellos funda igual, pero la colonia nace a mano, y se dice antes.
+func _refresh_found_delegate(node: SimNode, state: WorldState, found_blocker: String) -> void:
+	var open := Ascension.governor_open(state)
+	var sealed := Shop.count_of(state, "seal") >= 1
+	_set_disabled(_found_delegate_button, not found_blocker.is_empty() or not open)
+	if not open:
+		_found_delegate_button.text = "🚩🎖️ Fundar y delegar · 🔒 legado"
+		_found_delegate_button.tooltip_text = GovernorSys.delegate_blocker(state, node)
+	elif not sealed:
+		_found_delegate_button.text = "🚩🎖️ Fundar y delegar · sin 🎖️: nacerá a mano"
+		_found_delegate_button.tooltip_text = (
+			"No te queda ningún 🎖️ Sello: funda igual, con el mismo coste, pero la colonia nace a "
+			+ "mano. Séllala después desde 🛒 y quedará delegada."
+		)
+	else:
+		_found_delegate_button.text = "🚩🎖️ Fundar y delegar"
+		_found_delegate_button.tooltip_text = (
+			"Funda igual, con el mismo coste, y gasta un 🎖️ Sello al salir: la colonia nace "
+			+ "sellada y en manos de un gobernador equilibrado. Para llevarla a mano, entra en "
+			+ "ella y pulsa 🖐️."
+		)
+	if not found_blocker.is_empty():
+		_found_delegate_button.tooltip_text = found_blocker
 
 
 ## ⏩ El botón de acelerar: solo con una expedición en camino y desde Ciudad, que es donde hay oro
@@ -1696,8 +1948,10 @@ func _refresh_children(node: SimNode, state: WorldState) -> void:
 	_children_title.text = "Colonias"
 	for i in alive.size():
 		var child := alive[i]
-		_children_rows[i].text = "🏘️ %s — %s · %s 👥" % [
+		# 🎖️ si está sellada, delegada o no: retomarle el mando no le quita el sello.
+		_children_rows[i].text = "🏘️ %s — %s · %s 👥%s" % [
 			child.name, Content.tier(child.tier).name.to_lower(), _short(child.total_pop),
+			" · 🎖️" if child.governor_unlocked else "",
 		]
 		_children_rows[i].set_meta("child_id", child.id)
 
@@ -2044,7 +2298,7 @@ static func _short(value: float) -> String:
 ## «más o menos por aquí» cuando lo que hay que decir es «seis personas a la granja». Con
 ## botones el número es exacto, se ve cuánta gente cabe, y queda claro que a nadie lo destinan
 ## por ti.
-func _refresh_jobs(node: SimNode, _params: SimParams) -> void:
+func _refresh_jobs(node: SimNode, _params: SimParams, state: WorldState = null) -> void:
 	var workers := Integrator.effective_workers(node)
 	var idle := Integrator.idle_population(node)
 
@@ -2053,14 +2307,29 @@ func _refresh_jobs(node: SimNode, _params: SimParams) -> void:
 
 	if _delegate_button != null:
 		var delegated := node.is_delegated()
+		# En cada refresco, y sin señal: si `Main` rechaza un toggle (la puerta), el botón vuelve
+		# a su sitio aquí en vez de quedarse hundido.
 		_delegate_button.set_pressed_no_signal(delegated)
+		# La puerta es la de `Main` (`GovernorSys.delegate_blocker`). Retomar el mando no pasa
+		# por ella: un nodo delegado siempre se puede soltar. Sin `state` (las sondas que llaman
+		# a esto sueltos) se pinta como antes de la puerta.
+		var blocker := "" if delegated or state == null \
+			else GovernorSys.delegate_blocker(state, node)
+		_set_disabled(_delegate_button, not blocker.is_empty())
 		# El peaje se dice **antes** de pulsar: delegado ya no hace falta, lo cuenta la consola.
-		# Solo `.text`: el botón lleva emoji y tocarle el tema en el árbol cuesta ~6 ms.
+		# Solo `.text`, `disabled` y `tooltip_text`: el botón lleva emoji y tocarle el tema en el
+		# árbol cuesta ~6 ms.
 		var percent := _governor_efficiency * 100.0
-		_delegate_button.text = "🎖️ Gobernador" if delegated \
-			else "🖐️ A mano · delegar al %.0f %%" % percent
-		_delegate_button.tooltip_text = \
-			"Un gobernador reparte y construye por ti, al %.0f %% de rendimiento." % percent
+		if delegated:
+			_delegate_button.text = "🎖️ Gobernador"
+		elif not blocker.is_empty():
+			# Sin Consejo, la llave está en el legado; con él, en la 🛒 (un 🎖️ Sello por nodo).
+			_delegate_button.text = "🎖️ Delegar · 🔒 legado" \
+				if not Ascension.governor_open(state) else "🎖️ Delegar · 🔒 sello"
+		else:
+			_delegate_button.text = "🖐️ A mano · delegar al %.0f %%" % percent
+		_delegate_button.tooltip_text = blocker if not blocker.is_empty() \
+			else "Un gobernador reparte y construye por ti, al %.0f %% de rendimiento." % percent
 
 	_refresh_governor(node)
 
@@ -2097,6 +2366,9 @@ func _refresh_governor(node: SimNode) -> void:
 	if _governor_box == null:
 		return
 	var gov := node.governor
+	# Solo con gobernador. Sin 🎖️ Consejo no hay forma de ponerlo (`delegate_blocker`), así que en
+	# la era 1 la consola no se pinta; si aun así lo hay —un save v5 migrado, o la primitiva de las
+	# herramientas—, se enseña: es un gobernador de verdad y se tiene que poder retocar.
 	_governor_box.visible = gov != null
 	if gov == null:
 		return

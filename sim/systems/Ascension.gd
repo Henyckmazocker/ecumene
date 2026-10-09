@@ -26,6 +26,9 @@ class Bonuses:
 	## Multiplicador de la duración de las expediciones: `1 − 0,08 × rangos` de 🧭 Caminos
 	## antiguos. Lo lee `Promotion.expedition_cycles` al salir; nunca baja de cero.
 	var expedition: float = 1.0
+	## 🎖️ Sellos que regala 🎖️ Consejo al empezar cada era, uno por rango. Que sea ≥ 1 es lo que
+	## abre la delegación (`governor_open`).
+	var seals: int = 0
 
 
 ## Rangos comprados de cada nodo de legado.
@@ -55,6 +58,7 @@ static func bonuses(state: WorldState) -> Bonuses:
 			Legacy.Effect.START_LEGACY: b.start_goods += total
 			Legacy.Effect.HEIRS: b.heirs += int(total)
 			Legacy.Effect.EXPEDITION: b.expedition = maxf(b.expedition - total, 0.0)
+			Legacy.Effect.GOVERNOR_UNLOCK: b.seals += int(total)
 	return b
 
 
@@ -123,16 +127,32 @@ static func ascend(state: WorldState, params: SimParams, events: SimEventLog) ->
 	fresh.legacy = state.legacy + gained
 	fresh.legacy_nodes = state.legacy_nodes.duplicate()
 	fresh.era = state.era + 1
+	# El inventario se conserva, como el legado: es algo que se ha comprado. Los ⚡ boosts no,
+	# viven en los nodos y mueren con ellos. El goteo se **rebasa** al reloj nuevo, que vuelve a 0:
+	# conserva lo que llevaba recorrido hacia el siguiente ⌛ (`cycle − drip_cycle`). Copiado tal
+	# cual, un `drip_cycle` de la era vieja bloquearía el goteo tantos ciclos como durase aquella.
+	fresh.items = state.items.duplicate()
+	fresh.drip_held = state.drip_held
+	fresh.drip_cycle = fresh.cycle - (state.cycle - state.drip_cycle)
 	var b := bonuses(fresh)
 	if b.start_goods > 0.0:
 		var root := fresh.root()
 		root.stocks[Goods.FOOD] += b.start_goods
 		root.stocks[Goods.WOOD] += b.start_goods
+	# El regalo de 🎖️ Consejo. Se suma a lo que ya traía el inventario: los sellos que sobraron
+	# de la era anterior se quedan, como el resto de objetos.
+	Shop.grant(fresh, "seal", b.seals, events, "legacy")
 	if events != null:
 		events.push("ascension", state.cycle, -1,
 			"Asciendes a la era %d con %d de legado" % [fresh.era, int(gained)],
 			{"gained": gained, "era": fresh.era, "peak_tier": state.peak_tier})
 	return fresh
+
+
+## Con 🎖️ Consejo comprado se puede delegar, si el nodo está sellado. Es solo la mitad del
+## legado de la puerta; la otra, el sello por nodo, la pone quien decide delegar.
+static func governor_open(state: WorldState) -> bool:
+	return bonuses(state).seals >= 1
 
 
 static func rank_of(state: WorldState, id: String) -> int:
@@ -169,4 +189,9 @@ static func buy(state: WorldState, id: String, events: SimEventLog) -> bool:
 	state.legacy_nodes.append(id)
 	if events != null:
 		events.push("legacy", state.cycle, -1, "Legado: %s" % def.name, {"id": id})
+	# 🎖️ Consejo regala su sello en el acto, uno por rango comprado: la llave se compra a mitad de
+	# era y, sin sello hasta la ascensión siguiente, no abriría nada. El regalo de cada era
+	# (`ascend`) va aparte y se suma a este.
+	if def.effect == Legacy.Effect.GOVERNOR_UNLOCK:
+		Shop.grant(state, "seal", int(def.per_rank), events, "legacy")
 	return true

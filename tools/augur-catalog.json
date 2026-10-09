@@ -238,6 +238,47 @@
         "cycle": {"type": "number", "description": "Ciclo de juego tras acreditar"},
         "channel": {"type": "string", "description": "dev | release | debug"}
       }
+    },
+    {
+      "name": "item_bought",
+      "description": "🛒 Se compra un objeto en la tienda (⌛ salto, ⚡ boost o 🎖️ sello), pagando el precio entero en 🪙 o 📜 del almacén del nodo enfocado. Lo comprado va al inventario de la partida.",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id estable del nodo que paga (el enfocado)"},
+        "tier": {"type": "number", "description": "Escala del nodo que paga"},
+        "item": {"type": "string", "description": "Id del objeto (skip_15m, skip_1h, skip_4h, boost_x2, boost_x4, seal)"},
+        "good": {"type": "string", "description": "Con qué se paga: gold | culture (pagar con culture baja la influencia)"},
+        "price": {"type": "number", "description": "Lo pagado, en unidades de good"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "item_used",
+      "description": "Se usa un objeto del inventario: un ⌛ salto avanza el mundo entero; un ⚡ boost acelera el nodo enfocado o, con all, uno por nodo de su subárbol.",
+      "properties": {
+        "actor": {"type": "string", "description": "player | governor | system"},
+        "node_id": {"type": "number", "description": "Id estable del nodo enfocado al usarlo"},
+        "tier": {"type": "number", "description": "Escala de ese nodo"},
+        "item": {"type": "string", "description": "Id del objeto (skip_15m, skip_1h, skip_4h, boost_x2, boost_x4)"},
+        "nodes": {"type": "number", "description": "Nodos afectados: los del subárbol con un ⚡ en todos, 1 con uno aquí, todos los vivos con un ⌛"},
+        "all": {"type": "bool", "description": "⚡ en todos los del subárbol (los ⌛ van siempre a true: son del mundo)"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
+    },
+    {
+      "name": "item_dripped",
+      "description": "Cae un ⌛ gratis del goteo (uno cada 3.600 ciclos mientras haya menos de 3 goteados en reserva). Actor system.",
+      "properties": {
+        "actor": {"type": "string", "description": "system"},
+        "item": {"type": "string", "description": "Id del objeto que cae (skip_15m)"},
+        "era": {"type": "number", "description": "Era en curso"},
+        "cycle": {"type": "number", "description": "Ciclo de juego en que cae; se reinicia en cada era"},
+        "channel": {"type": "string", "description": "dev | release | debug"}
+      }
     }
   ]
 }

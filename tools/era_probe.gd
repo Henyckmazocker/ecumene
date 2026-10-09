@@ -12,6 +12,10 @@ extends SceneTree
 ##                 tramo que cabe en la suite. Por defecto `h4`
 ##   --full=1      no para en Región y recorre el tope entero: da el coste de reloj del tramo
 ##                 largo aunque el balance de hoy llegue antes
+##   --no-proxy    la era 2 sin el proxy (M3 de «Plan - Gobernador por sello»): compra 🎖️ Consejo
+##                 antes que nada y **solo** delega la raíz, sellándola con `Shop.use_seal` y el
+##                 sello que regala Consejo. Lo demás nace sellado o no se delega. La era 1 sigue
+##                 con la primitiva: jugada a mano no se mide
 ##
 ## Con el balance de M5 de «Plan - Balance de la era», Región cae en el 175.475 y la sonda tarda
 ## ~13 s de reloj por semilla (~52 s las 4). Con `--full=1`, hasta los 260.000, ~28 s. Con
@@ -75,6 +79,8 @@ const MID_CYCLE := 100000.0
 ## La 5.ª expedición de la raíz es la primera que sale siendo Ciudad (con el reloj ×7): la que
 ## calibra cuánto oro hay entre dos llegadas para pagar «⏩ Acelerar».
 const CALIBRATION_EXPEDITION := 5
+## Ventana de la primera Ciudad con la que se ajustan los precios de `data/Items.gd`: 1,5 h.
+const SHOP_WINDOW := 5400.0
 
 
 func _init() -> void:
@@ -86,13 +92,15 @@ func _init() -> void:
 	var until_h3: bool = args.get("until", "h4") == "h3"
 	var max_cycles := H3_CEILING if until_h3 else float(args.get("max", str(DEFAULT_MAX_CYCLES)))
 	var full: bool = args.get("full", "0") == "1" and not until_h3
+	var no_proxy: bool = args.get("no-proxy", "0") == "1"
 
-	print("=== era_probe · paso %.0f · tope era 1 %.0f ciclos · %s ===" % [
+	print("=== era_probe · paso %.0f · tope era 1 %.0f ciclos · %s%s ===" % [
 		step, max_cycles, "hasta H3" if until_h3 else ("tope entero" if full else "hasta H4"),
+		" · era 2 sin proxy" if no_proxy else "",
 	])
 	var rows: Array = []
 	for seed_value in seeds:
-		rows.append(_run(seed_value, step, max_cycles, until_h3, full))
+		rows.append(_run(seed_value, step, max_cycles, until_h3, full, no_proxy))
 	_table(rows)
 	_summary(rows)
 	_gold_table(rows)
@@ -101,7 +109,9 @@ func _init() -> void:
 
 ## Las dos eras de una semilla. Devuelve la fila: ciclo de cada hito (-1 si no llega), legado,
 ## nodos comprados y segundos de reloj de cada era.
-func _run(seed_value: int, step: float, max_cycles: float, until_h3: bool, full: bool) -> Dictionary:
+func _run(
+	seed_value: int, step: float, max_cycles: float, until_h3: bool, full: bool, no_proxy: bool
+) -> Dictionary:
 	var row := {
 		"seed": seed_value, "legacy": 0.0, "bought": [], "clock1": 0.0, "clock2": 0.0,
 		"arrivals": [], "lost": 0,
@@ -183,8 +193,26 @@ func _run(seed_value: int, step: float, max_cycles: float, until_h3: bool, full:
 	engine.adopt(fresh)
 	state = engine.state
 	root = state.root()
-	row["bought"] = TestUtil.spend_legacy(state)
-	GovernorSys.delegate(state, root, Governor.balanced())
+	if no_proxy:
+		# Sin proxy: Consejo primero —sin él no se delega nada—, el resto con la política de
+		# siempre, y la raíz por la ruta del jugador (🛒 «Usar aquí»). Sin sello no hay era 2.
+		var council := PackedStringArray()
+		if Ascension.buy(state, "council", null):
+			council.append("council")
+		row["bought"] = council + TestUtil.spend_legacy(state)
+		var sealed := Shop.use_seal(state, root, false, null)
+		print("  era 2 sin proxy: %d 🎖️ en el inventario al empezar, la raíz %s" % [
+			Shop.count_of(state, "seal") + sealed,
+			"sellada y delegada" if sealed == 1
+				else "sin sellar: %s" % Shop.use_blocker(state, root, "seal", false),
+		])
+		if sealed != 1:
+			print("  sin sello en la raíz la era 2 no se mide")
+			_release(engine)
+			return row
+	else:
+		row["bought"] = TestUtil.spend_legacy(state)
+		GovernorSys.delegate(state, root, Governor.balanced())
 	print("  era 2: legado %.0f → %s (sobra %.0f)" % [
 		row["legacy"], ", ".join(row["bought"]), state.legacy,
 	])
@@ -220,6 +248,7 @@ static func _gold_sample(state: WorldState, root: SimNode, params: SimParams) ->
 		"root_gold": root.stocks[Goods.GOLD],
 		"cap": root.storage_caps(params)[Goods.GOLD],
 		"rate": seg.slope[Goods.GOLD] * root.pop + seg.offset[Goods.GOLD],
+		"culture_rate": seg.slope[Goods.CULTURE] * root.pop + seg.offset[Goods.CULTURE],
 	}
 
 
@@ -250,6 +279,15 @@ static func _watch_gold(
 		snaps["H3c"] = s
 	if s["cycle"] >= MID_CYCLE and not snaps.has("100k"):
 		snaps["100k"] = s
+	# 🛒 Precios de la tienda (M5 de «Plan - Objetos de tiempo»): el oro sin fijar que produce la
+	# raíz en su primera hora y media como Ciudad, y su tasa al cerrarla.
+	if not snaps.has("shop"):
+		gw["shop_income"] = gw.get("shop_income", 0.0) + s["rate"] * dt
+		gw["shop_culture"] = gw.get("shop_culture", 0.0) + s["culture_rate"] * dt
+		if s["cycle"] >= row["H3c"] + SHOP_WINDOW:
+			snaps["shop"] = s
+			row["shop_income"] = gw["shop_income"]
+			row["shop_culture"] = gw["shop_culture"]
 	# Ritmo de oro de la raíz entre Ciudad y Región: la tasa sin fijar, integrada muestra a muestra.
 	if row["H4"] < 0.0:
 		gw["rate_sum"] += s["rate"] * dt
@@ -387,6 +425,18 @@ static func _gold_table(rows: Array) -> void:
 		line += "  %s" % (("%.0f" % snaps["6p"]["cycle"]) if snaps.has("6p") else "—")
 		print(line)
 	print("")
+	print("🛒 la primera Ciudad, de H3c a H3c + %.0f ciclos (precios de data/Items.gd):" % SHOP_WINDOW)
+	for row in rows:
+		var snaps: Dictionary = row.get("snaps", {})
+		if not snaps.has("shop"):
+			print("  %d: sin datos" % row["seed"])
+			continue
+		print("  %d: 🪙 sin fijar %.0f en la ventana (%.3f 🪙/ciclo de media) · tasa al cerrarla %.3f · 🪙 raíz %.0f (tope %.0f) · 📜 %.0f (%.3f/ciclo)" % [
+			row["seed"], row["shop_income"], row["shop_income"] / SHOP_WINDOW,
+			snaps["shop"]["rate"], snaps["shop"]["root_gold"], snaps["shop"]["cap"],
+			row["shop_culture"], row["shop_culture"] / SHOP_WINDOW,
+		])
+	print("")
 	print("raíz entre Ciudad y Región, y la 5.ª expedición (la 1.ª como Ciudad):")
 	for row in rows:
 		var snaps: Dictionary = row.get("snaps", {})
@@ -438,4 +488,6 @@ static func _args() -> Dictionary:
 		if a.begins_with("--") and a.contains("="):
 			var kv := a.substr(2).split("=", true, 1)
 			out[kv[0]] = kv[1]
+		elif a.begins_with("--"):
+			out[a.substr(2)] = "1"  # interruptor sin valor, como `--no-proxy`
 	return out

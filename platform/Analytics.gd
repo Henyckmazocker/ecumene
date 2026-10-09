@@ -286,6 +286,21 @@ func _on_event(entry: Dictionary) -> void:
 			props["pop"] = node.pop if node != null else 0.0
 			Augur.track("delegation", props)
 			return
+		# 🛒 Objetos (`Shop`). Salen como el resto, del log: `Shop` no sabe que hay analítica.
+		SimEventLog.ITEM_BOUGHT:
+			props["node_id"] = node_id
+			props["tier"] = _tier_of(node_id)
+			props["item"] = String(data.get("item", ""))
+			props["good"] = String(data.get("good", ""))
+			props["price"] = float(data.get("price", 0.0))
+		SimEventLog.ITEM_USED:
+			props["node_id"] = node_id
+			props["tier"] = _tier_of(node_id)
+			props["item"] = String(data.get("item", ""))
+			props["nodes"] = int(data.get("nodes", 0))
+			props["all"] = bool(data.get("all", false))
+		SimEventLog.ITEM_DRIPPED:
+			props["item"] = String(data.get("item", ""))
 		_:
 			return
 	Augur.track(category, props)

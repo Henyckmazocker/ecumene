@@ -15,6 +15,13 @@ signal traced(kind: String, cycle: float, node_id: int, data: Dictionary)
 
 const CAPACITY := 256
 
+## Categorías de los objetos (`Shop`, plan «Objetos de tiempo»). Las demás categorías son literales
+## en quien las anota; estas tres viven aquí porque las comparten `Shop`, `Analytics` y los tests.
+## `item_bought {item, good, price}` · `item_used {item, nodes, all}` · `item_dripped {item}`.
+const ITEM_BOUGHT := "item_bought"
+const ITEM_USED := "item_used"
+const ITEM_DRIPPED := "item_dripped"
+
 var enabled: bool = true
 var write_files: bool = false
 var entries: Array[Dictionary] = []

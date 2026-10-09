@@ -43,6 +43,23 @@ var starving: bool = false
 var governor: Governor = null
 ## Ciclo en el que el gobernador revisó decisiones por última vez.
 var governor_last_cycle: float = 0.0
+## 🎖️ Sellado (plan Gobernador por sello): con 🎖️ Consejo, el nodo se puede delegar. Es permanente:
+## retomar el mando no lo quita y volver a delegar no gasta otro sello. Lo pone `GovernorSys.seal`,
+## y `Promotion.arrive` a las colonias que nacen delegadas. **No** lo mira `GovernorSys.delegate`,
+## que es la primitiva: la puerta es `GovernorSys.delegate_blocker`. Esquema 6.
+var governor_unlocked: bool = false
+
+## ⚡ Ritmo propio del nodo (plan Objetos de tiempo). Con un boost `k`, cada tramo de `span` ciclos
+## globales el nodo avanza `k·span` ciclos **suyos**: producción, consumo, crecimiento, su
+## gobernador y su expedición en camino. 1 es sin boost. Se apaga en `boost_until`, que es ciclo
+## **global**: es lo único del boost que no se dilata (`SimEngine.tick` parte el tramo ahí).
+## Entran en el save y en el `state_hash` (esquema 5); un save v4 carga sin boost.
+var boost_factor: float = 1.0
+var boost_until: float = 0.0
+## Reloj propio, en ciclos del nodo: avanza `k·span` por tramo, y con él cuenta el gobernador
+## (`GovernorSys.run`). En un nodo que nunca ha tenido boost es **igual** a `state.cycle`, bit a
+## bit (`SimEngine._advance_all`), así que un nodo que no se acelera decide como siempre.
+var local_cycle: float = 0.0
 
 ## Caché recalculada tras cada tick — nunca se serializa, se deriva.
 var total_pop: float = 0.0
@@ -154,6 +171,12 @@ func duplicate_node() -> SimNode:
 	n.starving = starving
 	n.governor = governor.duplicate_governor() if governor != null else null
 	n.governor_last_cycle = governor_last_cycle
+	n.governor_unlocked = governor_unlocked
+	# La sonda de `Logistics._first_breach` avanza copias: sin el ritmo, predeciría el corte con
+	# el reloj de otro.
+	n.boost_factor = boost_factor
+	n.boost_until = boost_until
+	n.local_cycle = local_cycle
 	n.total_pop = total_pop
 	n.route_offset = route_offset.duplicate()
 	return n
@@ -174,13 +197,18 @@ func to_dict() -> Dictionary:
 		"upgrades": Array(upgrades),
 		"starving": starving,
 		"gov_cycle": governor_last_cycle,
+		"gov_unlocked": governor_unlocked,
+		"boost_factor": boost_factor,
+		"boost_until": boost_until,
+		"local_cycle": local_cycle,
 	}
 	if governor != null:
 		d["governor"] = governor.to_dict()
 	return d
 
 
-static func from_dict(d: Dictionary) -> SimNode:
+## `world_cycle` es el reloj del mundo del save: el `local_cycle` de un nodo que no lo trae (save v4).
+static func from_dict(d: Dictionary, world_cycle: float = 0.0) -> SimNode:
 	var n := SimNode.new()
 	n.id = int(d["id"])
 	n.tier = int(d["tier"])
@@ -198,6 +226,13 @@ static func from_dict(d: Dictionary) -> SimNode:
 	n.governor_last_cycle = float(d.get("gov_cycle", 0.0))
 	if d.has("governor"):
 		n.governor = Governor.from_dict(d["governor"])
+	# 🎖️ Un save v5 no lo trae: la migración 5 → 6 (`Save.migrate`) sella los delegados; si llega
+	# hasta aquí sin la clave (un dict suelto de test), el nodo no está sellado.
+	n.governor_unlocked = bool(d.get("gov_unlocked", false))
+	# ⚡ Un save v4 no trae ritmo: el nodo carga sin boost y al paso del mundo.
+	n.boost_factor = float(d.get("boost_factor", 1.0))
+	n.boost_until = float(d.get("boost_until", 0.0))
+	n.local_cycle = float(d.get("local_cycle", world_cycle))
 	# El catálogo puede haber crecido entre versiones: los arrays por edificio se reajustan.
 	var count := Content.building_count()
 	if n.buildings.size() != count:

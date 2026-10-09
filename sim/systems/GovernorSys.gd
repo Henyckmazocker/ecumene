@@ -137,7 +137,10 @@ static func run(
 	if not node.is_delegated():
 		return 0
 	var interval := maxf(params.governor_interval, 1.0)
-	var due := int(floor((state.cycle - node.governor_last_cycle) / interval))
+	# Con el reloj del nodo, no con el del mundo: un nodo con ⚡ ×4 decide cada 30 ciclos **suyos**,
+	# cuatro veces más a menudo en tiempo real. Sin boost es `state.cycle`, bit a bit.
+	var now := clock_of(state, node)
+	var due := int(floor((now - node.governor_last_cycle) / interval))
 	if due <= 0:
 		return 0
 	# Acotado: un mes offline no dispara miles de decisiones retroactivas.
@@ -161,7 +164,7 @@ static func run(
 	# temprana— dependería del tamaño del tick. Solo con el tope lleno se descarta el atraso:
 	# para eso existe, para que un mes fuera no deje cientos de decisiones pendientes.
 	if due >= 64:
-		node.governor_last_cycle = state.cycle
+		node.governor_last_cycle = now
 	else:
 		node.governor_last_cycle += float(due) * interval
 	return due
@@ -173,9 +176,58 @@ static func run(
 ## El reloj de checkpoints arranca **ahora**: con `governor_last_cycle` a cero, el primer `run`
 ## creería que debe todos los checkpoints desde el ciclo 0 y tomaría de golpe hasta 64
 ## decisiones atrasadas en un nodo que acaba de nacer.
+##
+## **Sin puerta** (plan Gobernador por sello): ni 🎖️ Consejo ni sello. La puerta está antes, en
+## quien decide (`delegate_blocker`); así los tests, `era_probe` y el modo captura siguen delegando
+## con ella como proxy de un jugador atento.
 static func delegate(state: WorldState, node: SimNode, policy: Governor) -> void:
 	node.governor = policy
-	node.governor_last_cycle = state.cycle
+	node.governor_last_cycle = clock_of(state, node)
+
+
+## Por qué no se puede delegar sin 🎖️ Consejo. Es el primer paso de `delegate_blocker` (que añade
+## dónde se compra) y el de usar un 🎖️ Sello (`Shop.use_blocker`, que lo dice así desde «Objetos de
+## tiempo»), así que vive en un solo sitio.
+const NEEDS_COUNCIL := "se desbloquea con 🎖️ Consejo"
+
+
+## Por qué `node` no se puede delegar, en una frase para la UI; "" si se puede.
+## La única lista, como `Promotion.found_child_blocker`: la leen el botón, `Main` y «Fundar y
+## delegar». Mira `governor_unlocked` y no el inventario: retomar el mando y volver a delegar un
+## nodo sellado no gasta otro sello.
+static func delegate_blocker(state: WorldState, node: SimNode) -> String:
+	if not Ascension.governor_open(state):
+		return NEEDS_COUNCIL + ", en el legado"
+	if node == null:
+		return "no hay ningún nodo enfocado"
+	if not node.governor_unlocked:
+		return "hace falta un 🎖️ Sello"
+	return ""
+
+
+## 🎖️ Sella `node` y lo delega en el acto, con `Governor.balanced()`. Sellar es la forma de delegar
+## un nodo sin sello: no hay un paso intermedio «sellado pero a mano». Un nodo que ya estaba
+## delegado (por la primitiva) conserva su política. Retomar el mando después sigue siendo gratis.
+##
+## No gasta nada ni mira la puerta: eso es de `Shop.use_seal`, que también anota el `item_used`.
+## Aquí sale el `governor {delegated: true}`, el mismo que `Main._on_delegation_toggled`, y solo si
+## de verdad pasa a manos de un gobernador.
+static func seal(state: WorldState, node: SimNode, events: SimEventLog) -> void:
+	node.governor_unlocked = true
+	if node.is_delegated():
+		return
+	delegate(state, node, Governor.balanced())
+	if events != null:
+		events.push("governor", state.cycle, node.id,
+			"%s pasa a manos de un gobernador" % node.name, {"delegated": true})
+
+
+## ⚡ El reloj con el que cuenta el gobernador de un nodo: el suyo (`SimNode.local_cycle`), que con
+## un boost va por delante del mundo. **Nunca por detrás**: el boost solo adelanta, y quien mueve
+## `state.cycle` sin pasar por `SimEngine.tick` (los tests que llaman a `run` sueltos) no puede
+## dejar al gobernador sin checkpoints. Sin boost es `state.cycle`, bit a bit.
+static func clock_of(state: WorldState, node: SimNode) -> float:
+	return maxf(node.local_cycle, state.cycle)
 
 
 static func _decide(

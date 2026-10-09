@@ -143,7 +143,10 @@ static func launch_expedition(
 	e.parent_id = node.id
 	e.tier = node.tier - 1
 	e.depart_cycle = state.cycle
-	e.arrive_cycle = state.cycle + expedition_cycles(state, node, params)
+	# El viaje cuenta en ciclos del nodo: con un ⚡ boost activo llega antes. Sin boost es
+	# `state.cycle + expedition_cycles`, bit a bit lo de siempre.
+	e.arrive_cycle = Expedition.arrival(state.cycle, expedition_cycles(state, node, params),
+		node.boost_factor, node.boost_until)
 	e.pop = settler_pop(params)
 	e.food = settler_food(params)
 	e.delegate_policy = delegate_policy
@@ -241,8 +244,11 @@ static func arrive(state: WorldState, e: Expedition, events: SimEventLog) -> Sim
 	# ahí el reparto de la colonia es cosa de quien la lleve.
 	child.jobs[Content.building_index("farm")] = ceil(settlers * 0.6)
 	child.jobs[Content.building_index("woodcutter")] = floor(settlers * 0.4)
-	# La política se copió al salir: no se vuelve a mirar al padre.
+	# La política se copió al salir: no se vuelve a mirar al padre. Nace 🎖️ sellada: la de un
+	# gobernador, gratis (sin eso 👑 Dinastía no tendría árbol); la de «Fundar y delegar», con el
+	# sello que se gastó al salir (`Shop.found_and_delegate`).
 	if e.delegate_policy != null:
+		child.governor_unlocked = true
 		GovernorSys.delegate(state, child, e.delegate_policy)
 	if events != null:
 		# Con el actor de quien la mandó, como salía al fundar al instante.

@@ -105,6 +105,8 @@ func _ready() -> void:
 	hud.upgrade_requested.connect(_on_upgrade)
 	hud.legacy_requested.connect(_on_legacy)
 	hud.ascension_requested.connect(_on_ascend)
+	hud.item_buy_requested.connect(_on_item_buy)
+	hud.item_use_requested.connect(_on_item_use)
 	hud.focus_requested.connect(_on_focus_requested)
 	# Conectar antes de arrancar: si no, el evento de fundación de la partida se pierde.
 	engine.cycle_advanced.connect(_on_cycle_advanced)
@@ -181,6 +183,7 @@ func _maybe_capture() -> void:
 	var focus_child := -1
 	var shot_depth := -1.0
 	var shot_fade := -1.0
+	var shot_boost := ""
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--shot="):
 			shot = arg.substr(7)
@@ -206,6 +209,8 @@ func _maybe_capture() -> void:
 			shot_depth = maxf(float(arg.substr(13)), 0.0)
 		elif arg.begins_with("--shot-fade="):
 			shot_fade = clampf(float(arg.substr(12)), 0.0, 1.0)
+		elif arg.begins_with("--shot-boost="):
+			shot_boost = "boost_" + arg.substr(13)
 	if shot.is_empty():
 		return
 	if _catch_up != null:
@@ -266,6 +271,17 @@ func _maybe_capture() -> void:
 		_refresh_hud()
 	# La captura tiene que adelantar también el **reloj visual**: son dos simulaciones y la
 	# hora del pueblo no depende del ciclo económico. `--shot-hour=13` fotografía el mediodía.
+	# `--shot-boost=x2` (o `x4`): un ⚡ sobre el nodo enfocado, para fotografiar su estado en 📊.
+	# Se mete en el inventario con `Shop.grant` —la entrada de crédito que no cobra— y se usa por
+	# `Shop.use_boost`, la misma ruta que el botón «Usar aquí».
+	if not shot_boost.is_empty():
+		var def := Items.get_def(shot_boost)
+		if def == null or def.kind != Items.Kind.BOOST:
+			push_warning("--shot-boost: no hay ningún ⚡ «%s»" % shot_boost)
+		else:
+			Shop.grant(engine.state, shot_boost, 1, engine.events, "shot")
+			Shop.use_boost(engine.state, focused(), shot_boost, false, engine.events)
+			_refresh_hud()
 	if tab >= 0:
 		hud.select_tab(tab)
 	if hour >= 0.0:
@@ -378,18 +394,43 @@ func _forced_offline_seconds() -> float:
 ## pasos era el cuelgue, y dejar que el jugador construya sobre un mundo que está avanzando a
 ## saltos de 700 ciclos sería peor que hacerle esperar medio segundo.
 func _begin_catch_up(away_seconds: float) -> void:
-	_catch_up = engine.begin_catch_up(away_seconds)
-	if _catch_up == null:
+	var job := engine.begin_catch_up(away_seconds)
+	if job == null:
 		return
-	_catch_up_started = float(Time.get_ticks_msec()) / 1000.0
-	_catch_up_percent = -1
 	# Lo que pase hasta `_end_catch_up` se resume en un solo `offline_return`. La ausencia va
 	# sin recortar: el tope lo cuenta el informe.
 	Analytics.begin_offline(away_seconds)
+	_show_catch_up(job)
+
+
+## ⌛ Usa el salto `id` del inventario: el mundo entero avanza sus ciclos por la **misma barra**
+## que una ausencia, repartidos entre fotogramas, así que un +4 h con medio árbol delegado no
+## congela el juego. Devuelve el motivo si no se puede (el de `SimEngine.skip_blocker`, el mismo
+## que pinta el botón), o vacío. Lo llama la pestaña 🛒 (`_on_item_use`).
+##
+## Un salto es tiempo online: no pasa por `Analytics.begin_offline` (lo que decida el gobernador
+## durante el salto sale como saldría jugando) y al acabar no hay informe de vuelta.
+func use_skip(id: String) -> String:
+	var blocker := engine.skip_blocker(id)
+	if not blocker.is_empty():
+		return blocker
+	var job := engine.use_skip(id, focused())
+	if job == null:
+		return "no hay nada que saltar"
+	_show_catch_up(job)
+	return ""
+
+
+## Levanta la barra y bloquea la partida para consumir `job` a lo largo de los fotogramas
+## (`_advance_catch_up`). La comparten la ausencia y el ⌛ salto.
+func _show_catch_up(job: SimEngine.CatchUpJob) -> void:
+	_catch_up = job
+	_catch_up_started = float(Time.get_ticks_msec()) / 1000.0
+	_catch_up_percent = -1
 	# La cámara escucha en `_unhandled_input`, y un `Control` no consume los eventos de dedo ni
 	# los gestos: el velo del HUD no basta para dejarla quieta.
 	camera.set_process_unhandled_input(false)
-	hud.begin_catch_up(_catch_up.credited)
+	hud.begin_catch_up(_catch_up.credited, _catch_up.is_skip)
 
 
 ## Un fotograma de acreditación. Devuelve `true` si todavía queda (o si falta enseñar la barra
@@ -412,6 +453,7 @@ func _advance_catch_up() -> bool:
 ## El mundo despierta: un solo refresco de vista y HUD para los 43.200 ciclos acreditados, y el
 ## informe de vuelta en el mismo panel donde estaba la barra.
 func _end_catch_up() -> void:
+	var skip := _catch_up != null and _catch_up.is_skip
 	_catch_up = null
 	camera.set_process_unhandled_input(true)
 	# El nodo enfocado puede haberse despoblado mientras no estabas: se sube al ancestro vivo más
@@ -424,10 +466,17 @@ func _end_catch_up() -> void:
 			camera.reframe_if_untouched(view.settlement_extent(), view.terrain_bounds(),
 				_view_rect())
 		_refresh_hud()
-	hud.end_catch_up(engine.last_offline)
+	# Un ⌛ no tiene informe: `last_offline` es el de la última vuelta, no el del salto, y el
+	# panel se cierra sin contar nada.
+	hud.end_catch_up(null if skip else engine.last_offline)
 	# El mismo informe que acaba de enseñar la pantalla: la cifra del tablero es la que leyó el
 	# jugador. Antes del modal de consentimiento, que con él pendiente no hay sesión que mande.
-	Analytics.end_offline(engine.last_offline)
+	if not skip:
+		Analytics.end_offline(engine.last_offline)
+	else:
+		# El ⌛ ya está gastado y el mundo adelantado: que un cierre ahora no devuelva ni lo uno
+		# ni lo otro.
+		_save()
 	if _consent_pending:
 		_consent_pending = false
 		if Analytics.needs_consent_decision():
@@ -755,8 +804,8 @@ func _on_promote() -> void:
 ## propia. El hijo nace al llegar la expedición.
 ## Un nodo delegado no se toca desde aquí (regla 3): el botón ya sale apagado, y esto es la red.
 ##
-## Con `delegate` la colonia nace con un gobernador equilibrado, por `GovernorSys.delegate` al
-## llegar, la misma ruta que usa el gobernador cuando funda. No copia la política del padre porque
+## Con `delegate` y un 🎖️ en el inventario la colonia nace sellada y con un gobernador equilibrado,
+## por `GovernorSys.delegate` al llegar, la misma ruta que usa el gobernador cuando funda. No copia la política del padre porque
 ## aquí el padre **nunca** está delegado: si lo estuviera, esta función ya habría salido.
 ##
 ## Los eventos no salen de aquí: `expedition` lo emite `launch_expedition` al salir, y `found` y la
@@ -769,8 +818,13 @@ func _on_found(delegate: bool) -> void:
 	var node := focused()
 	if node == null or node.is_delegated():
 		return
-	var sent := Promotion.launch_expedition(engine.state, node, engine.params, engine.events,
-		Governor.balanced() if delegate else null)
+	# «🚩🎖️ Fundar y delegar» pasa por `Shop.found_and_delegate`: sin 🎖️ Consejo no sale, con un 🎖️
+	# lo gasta al salir y sin ninguno funda a mano. La misma lista para el botón y para aquí.
+	var sent: Expedition
+	if delegate:
+		sent = Shop.found_and_delegate(engine.state, node, engine.params, engine.events)
+	else:
+		sent = Promotion.launch_expedition(engine.state, node, engine.params, engine.events)
 	if sent == null:
 		return
 	view.refresh(node)
@@ -790,6 +844,39 @@ func _on_accelerate() -> void:
 		return
 	_refresh_hud()
 	_save()
+
+
+## 🛒 Comprar un objeto con 🪙 o 📜 del nodo enfocado, por `Shop.buy`: la misma lista de
+## condiciones (`Shop.buy_blocker`) que pinta el botón. El evento `item_bought` lo emite el sistema.
+## Se guarda al vuelo: es dinero que ya ha salido del almacén.
+func _on_item_buy(id: String, good: int) -> void:
+	var node := focused()
+	if node == null or _catch_up != null:
+		return
+	if Shop.buy(engine.state, node, id, good, engine.events):
+		_refresh_hud()
+		_save()
+
+
+## 🛒 Usar un objeto: un ⌛ por `use_skip` (el mundo entero, por la barra), un ⚡ por
+## `Shop.use_boost` y un 🎖️ por `Shop.use_seal`, sobre el nodo enfocado o, con `all`, su subárbol.
+## Mientras se acredita no se usa nada (`Shop.use_blocker` con `busy`); el velo ya lo impide, y esto
+## es la red.
+func _on_item_use(id: String, all: bool) -> void:
+	var node := focused()
+	var def := Items.get_def(id)
+	if node == null or def == null or _catch_up != null:
+		return
+	if def.kind == Items.Kind.SKIP:
+		use_skip(id)
+		return
+	# 🎖️ Sellar delega (`GovernorSys.seal`), y el gobernador recién puesto tiene que verse ya.
+	var used := Shop.use_seal(engine.state, node, all, engine.events) \
+		if def.kind == Items.Kind.SEAL \
+		else Shop.use_boost(engine.state, node, id, all, engine.events)
+	if used > 0:
+		_refresh_hud()
+		_save()
 
 
 ## Crear una ruta, cambiarle el caudal o borrarla (`rate` 0), siempre por `Logistics.set_route`:
@@ -817,11 +904,23 @@ func _on_route(from_id: int, to_id: int, good: int, rate: float) -> void:
 
 ## Delegar y recuperar el mando. Sin esto no había forma de quitarle un nodo a un gobernador
 ## una vez puesto, y el juego se quedaba comprando y repartiendo solo para siempre.
+##
+## Delegar pasa por la puerta (`GovernorSys.delegate_blocker`: 🎖️ Consejo y nodo sellado); el botón
+## ya sale apagado, y esto es la red. Y por la primitiva `GovernorSys.delegate`, que arranca el reloj
+## de checkpoints ahora: asignar el gobernador a pelo le dejaba decisiones atrasadas de golpe.
+## Retomar el mando es gratis y no quita el sello.
 func _on_delegation_toggled(delegated: bool) -> void:
 	var node := focused()
 	if node == null:
 		return
-	node.governor = Governor.balanced() if delegated else null
+	if delegated:
+		if not GovernorSys.delegate_blocker(engine.state, node).is_empty():
+			# El toggle ya se ha hundido: el refresco lo devuelve a su sitio sin señal.
+			_refresh_hud()
+			return
+		GovernorSys.delegate(engine.state, node, Governor.balanced())
+	else:
+		node.governor = null
 	engine.events.push("governor", engine.state.cycle, node.id,
 		"%s pasa a manos de un gobernador" % node.name if delegated
 		else "Retomas el mando de %s" % node.name, {"delegated": delegated})
@@ -861,7 +960,8 @@ func _on_governor_changed(field: String, value: float) -> void:
 ## ×0 del modal de consentimiento va directo al motor y no es una decisión de nadie.
 func _on_speed(index: int) -> void:
 	var before := engine.speed_index
-	engine.set_speed_index(index)
+	# Sin `--dev` no hay más que ⏸ y ▶, aunque algo (un atajo, un botón viejo) pida otra cosa.
+	engine.set_speed_index(mini(index, DevMode.max_speed_index(engine.params.speeds.size())))
 	_refresh_hud()
 	if engine.speed_index != before:
 		Analytics.on_speed(engine.speed_index)

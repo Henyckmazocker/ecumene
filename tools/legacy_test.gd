@@ -19,6 +19,10 @@ func _init() -> void:
 	failures += _ranks_and_costs()
 	failures += _old_roads_shorten_the_next_expedition()
 	failures += _ascending_keeps_the_legacy()
+	failures += _items_survive_ascension()
+	failures += _council_grants_seals_each_era()
+	failures += _council_purchase_grants_seal()
+	failures += _stewards_needs_council()
 	failures += _the_new_era_is_playable()
 	failures += _the_second_era_is_faster()
 	TestUtil.finish(self, failures)
@@ -300,6 +304,133 @@ func _ascending_keeps_the_legacy() -> int:
 			and fresh.root().stocks[Goods.WOOD] > barren.root().stocks[Goods.WOOD],
 		"«Primeras piedras» surte de provisiones al mundo nuevo",
 		"la era nueva arranca sin las provisiones del legado"
+	)
+	return failures
+
+
+## **El inventario sobrevive a la ascensión; los ⚡ boosts no** (Objetos de tiempo, M2). Los objetos
+## se han comprado y viven en el estado; el boost vive en un nodo, y los nodos mueren con la era. El
+## goteo se rebasa al reloj nuevo conservando lo recorrido: ni se pierde ni bloquea la era nueva.
+func _items_survive_ascension() -> int:
+	var engine := TestUtil.make_engine(907)
+	var state := engine.state
+	engine.tick(500.0)
+	SimEngine.apply_boost(state, state.root(), 4.0, 600.0)
+	engine.tick(50.0)
+	state.peak_pop = 9000.0
+	state.peak_tier = 1
+	state.items = {"skip_1h": 2, "boost_x2": 1, "seal": 1}
+	state.drip_cycle = state.cycle - 1234.0
+	state.drip_held = 1
+	var fresh := Ascension.ascend(state, engine.params, null)
+	var same := true
+	for def in Items.all():
+		if int(fresh.items.get(def.id, 0)) != int(state.items.get(def.id, 0)):
+			same = false
+	var root := fresh.root()
+	var failures := TestUtil.check(
+		fresh != state and same and fresh.drip_held == 1,
+		"el inventario sobrevive a la ascensión: %s, %d del goteo" % [fresh.items, fresh.drip_held],
+		"la ascensión pierde objetos: %s → %s, goteo %d" % [state.items, fresh.items, fresh.drip_held]
+	)
+	failures += TestUtil.check(
+		fresh.cycle - fresh.drip_cycle == 1234.0,
+		"y el goteo sigue a %.0f ciclos del último ⌛, rebasado al reloj nuevo" % (fresh.cycle - fresh.drip_cycle),
+		"el goteo no se rebasa: %.1f en el ciclo %.1f" % [fresh.drip_cycle, fresh.cycle]
+	)
+	failures += TestUtil.check(
+		root.boost_factor == 1.0 and root.local_cycle == fresh.cycle and fresh.min_boost_until == INF,
+		"y el ⚡ ×4 de la raíz muere con la era",
+		"un ⚡ cruza la ascensión: ×%.0f hasta %.1f" % [root.boost_factor, root.boost_until]
+	)
+	# Copia, no referencia: gastar en la era nueva no puede tocar el estado viejo.
+	fresh.items["seal"] = 0
+	failures += TestUtil.check(
+		int(state.items["seal"]) == 1,
+		"y es una copia: gastar en la era nueva no toca la vieja",
+		"la era nueva comparte el inventario con la vieja"
+	)
+	return failures
+
+
+## **🎖️ Consejo regala un sello por rango al empezar cada era**, y se suma a los que sobraron:
+## el oro para comprarlos solo llega en Ciudad, y sin el regalo la llave no abriría nada.
+func _council_grants_seals_each_era() -> int:
+	var engine := TestUtil.make_engine(908)
+	var state := engine.state
+	state.peak_pop = 9000.0
+	state.peak_tier = 1
+	var closed := not Ascension.governor_open(state)
+	state.legacy_nodes = PackedStringArray(["council", "council"])
+	var fresh := Ascension.ascend(state, engine.params, null)
+	var failures := TestUtil.check(
+		closed and Ascension.governor_open(fresh) and Ascension.bonuses(fresh).seals == 2
+			and int(fresh.items.get("seal", 0)) == 2,
+		"Consejo 2 abre los gobernadores y la era nueva empieza con 2 🎖️",
+		"Consejo no abre o no regala: abierto antes %s, %s en la era nueva" % [
+			not closed, fresh.items,
+		]
+	)
+	# Lo que sobra no se vacía: la era siguiente suma su regalo encima.
+	fresh.peak_pop = 9000.0
+	fresh.peak_tier = 1
+	var third := Ascension.ascend(fresh, engine.params, null)
+	failures += TestUtil.check(
+		int(third.items.get("seal", 0)) == 4,
+		"y los que sobran se quedan: 2 + 2 = %d 🎖️ en la era 3" % int(third.items.get("seal", 0)),
+		"los sellos sobrantes no se suman al regalo: %s" % third.items
+	)
+	return failures
+
+
+## **🎖️ Consejo da su sello en el acto, uno por rango comprado** (M3 de «Plan - Gobernador por
+## sello»). Comprado a mitad de era, sin él no habría nada que sellar hasta la ascensión siguiente.
+func _council_purchase_grants_seal() -> int:
+	var engine := TestUtil.make_engine(910)
+	var state := engine.state
+	state.legacy = 1000.0
+	var before := Shop.count_of(state, "seal")
+	var first := Ascension.buy(state, "council", null)
+	var after_one := Shop.count_of(state, "seal")
+	var failures := TestUtil.check(
+		first and before == 0 and after_one == 1 and Ascension.governor_open(state),
+		"comprar Consejo 1 da 1 🎖️ en el acto y abre los gobernadores",
+		"Consejo 1 no da su sello: %d → %d 🎖️ (comprado %s)" % [before, after_one, first]
+	)
+	var second := Ascension.buy(state, "council", null)
+	failures += TestUtil.check(
+		second and Shop.count_of(state, "seal") == 2,
+		"y el rango 2 da otro: %d 🎖️" % Shop.count_of(state, "seal"),
+		"Consejo 2 no da su sello: %d 🎖️ (comprado %s)" % [Shop.count_of(state, "seal"), second]
+	)
+	# Otro nodo del árbol no regala nada.
+	Ascension.buy(state, "fertile_soil", null)
+	failures += TestUtil.check(
+		Shop.count_of(state, "seal") == 2,
+		"y otro nodo de legado no da sellos",
+		"comprar otro nodo de legado da sellos: %d 🎖️" % Shop.count_of(state, "seal")
+	)
+	return failures
+
+
+## **🎓 Escuela de gobernadores cuelga de 🎖️ Consejo**, y con ella 👑 Dinastía: no tiene sentido
+## mejorar algo que todavía no tienes.
+func _stewards_needs_council() -> int:
+	var engine := TestUtil.make_engine(909)
+	var state := engine.state
+	state.legacy = 1000.0
+	Ascension.buy(state, "fertile_soil", null)
+	Ascension.buy(state, "old_crafts", null)
+	var failures := TestUtil.check(
+		not Ascension.can_buy(state, "stewards") and not Ascension.buy(state, "stewards", null),
+		"sin Consejo no hay Escuela, aunque haya Oficios antiguos y legado de sobra",
+		"se ha comprado la Escuela sin Consejo"
+	)
+	failures += TestUtil.check(
+		Ascension.can_buy(state, "council") and Ascension.buy(state, "council", null)
+			and Ascension.can_buy(state, "stewards"),
+		"Consejo es raíz, y comprarlo abre la Escuela",
+		"Consejo no se compra como raíz o no abre la Escuela"
 	)
 	return failures
 

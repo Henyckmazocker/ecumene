@@ -12,7 +12,12 @@ extends RefCounted
 ## 3 — rutas entre padre e hijo (`routes`, `next_route_id`, `routes_cycle`). Un save v2 carga sin
 ##     ninguna: no hay nada que migrar, solo defaults.
 ## 4 — expediciones en camino (`expeditions`). Un save v3 carga sin ninguna.
-const SCHEMA_VERSION := 4
+## 5 — objetos (`items`, `drip_cycle`, `drip_held`) y ⚡ boost por nodo (`boost_factor`,
+##     `boost_until`, `local_cycle`). Un save v4 carga sin objetos, sin boosts, con cada reloj de
+##     nodo en el del mundo y el goteo contando desde el ciclo en que se guardó.
+## 6 — 🎖️ sello por nodo (`gov_unlocked`). Un save v5 carga con sus nodos delegados sellados y
+##     el resto sin sellar, así que nadie pierde un gobernador que ya tenía.
+const SCHEMA_VERSION := 6
 
 var world_seed: int = 0
 var nodes: Dictionary = {}       ## id:int -> SimNode
@@ -39,6 +44,23 @@ var routes_cycle: float = 0.0
 ## por nodo como mucho. Los colonos que van dentro no cuentan en `total_pop` ni en `peak_pop`:
 ## han salido del padre y todavía no están en ninguna parte. Ascender las borra con la era.
 var expeditions: Array[Expedition] = []
+
+## ⚡ El primer `boost_until` de los nodos con boost, o `INF` si no hay ninguno. **Caché, no
+## estado**: `SimEngine.tick` parte el tramo ahí, y recorrer todos los nodos en cada tick se nota
+## con cientos. Se recalcula (`refresh_boost_end`) solo al usar o expirar un boost, al podar un
+## nodo y al cargar.
+var min_boost_until: float = INF
+
+## Inventario de objetos: id de `Items` → cuántos. **Se itera siempre por `Items.all()`**, no por
+## las claves: el orden de un Dictionary no es del contrato. Un id que no está vale 0. Sobrevive a
+## la ascensión, como el legado: es algo que se ha comprado.
+var items: Dictionary = {}
+## Ciclo del último goteo de ⌛ (lo mueve `Shop.drip`, M4). Se mide en `cycle`, así que cuenta
+## igual online, offline y dentro de un salto.
+var drip_cycle: float = 0.0
+## Cuántos de los `skip_15m` del inventario vienen del goteo: el tope lo mira a él, no a `items`,
+## para que comprar ⌛ no apague el goteo.
+var drip_held: int = 0
 
 @export_group("Ascensión")
 ## Meta-moneda persistente entre eras.
@@ -91,6 +113,8 @@ func add_node(tier: int, parent_id: int) -> SimNode:
 	var node_seed := hash(str(world_seed, ":", id))
 	var node := SimNode.create(id, tier, node_seed, NameGen.for_node(node_seed, tier))
 	node.parent_id = parent_id
+	# Nace con el reloj del mundo: sin boost, `local_cycle == cycle` siempre.
+	node.local_cycle = cycle
 	nodes[id] = node
 	if parent_id >= 0 and nodes.has(parent_id):
 		var parent: SimNode = nodes[parent_id]
@@ -356,6 +380,15 @@ func cancel_expedition_of(node_id: int) -> Expedition:
 	return null
 
 
+## Recalcula `min_boost_until` mirando todos los nodos.
+func refresh_boost_end() -> void:
+	min_boost_until = INF
+	for id in ordered_ids():
+		var n: SimNode = nodes[id]
+		if n.boost_factor != 1.0:
+			min_boost_until = minf(min_boost_until, n.boost_until)
+
+
 ## Tier máximo del árbol.
 func max_tier() -> int:
 	var best := 0
@@ -388,6 +421,19 @@ func state_hash() -> int:
 			buf.append_array(_f64(v))
 		for upgrade_id in n.upgrades:
 			buf.append_array(upgrade_id.to_utf8_buffer())
+		# ⚡ El ritmo del nodo, solo si se aparta del mundo (boost activo, o un reloj que se
+		# adelantó con uno ya expirado). Sin boost nunca, `local_cycle == cycle` bit a bit y la
+		# huella es la de siempre.
+		if n.boost_factor != 1.0 or n.local_cycle != cycle:
+			buf.append_array(_f64(n.boost_factor))
+			buf.append_array(_f64(n.boost_until))
+			buf.append_array(_f64(n.local_cycle))
+		# 🎖️ El sello, solo si dice algo que no diga ya el gobernador: el neutro es «sellado si y
+		# solo si delegado», que es justo lo que deja la migración 5 → 6 en un save viejo. Así un
+		# save v3-v5 carga con el hash con que se guardó, y lo que sí cuenta —sellado y a mano,
+		# o delegado sin sello por la primitiva— entra.
+		if n.governor_unlocked != (n.governor != null):
+			buf.append_array(_i64(1 if n.governor_unlocked else 0))
 	# Solo si hay alguna: sin rutas, la huella es la de siempre.
 	if not routes.is_empty():
 		buf.append_array(_f64(routes_cycle))
@@ -412,6 +458,17 @@ func state_hash() -> int:
 			# un save v4 de antes de acelerar carga con el hash con que se guardó.
 			if e.accelerations > 0:
 				buf.append_array(_i64(e.accelerations))
+	# Objetos, en el orden de `Items.all()` y solo los que se tienen: sin inventario, la huella es
+	# la de siempre (un save v4 carga con el hash con que se guardó).
+	for def in Items.all():
+		var count := int(items.get(def.id, 0))
+		if count != 0:
+			buf.append_array(def.id.to_utf8_buffer())
+			buf.append_array(_i64(count))
+	# El goteo, solo si se ha separado del reloj del mundo: un save v4 lo carga en `cycle`.
+	if drip_held != 0 or drip_cycle != cycle:
+		buf.append_array(_f64(drip_cycle))
+		buf.append_array(_i64(drip_held))
 	return _fnv1a(buf)
 
 
@@ -469,7 +526,21 @@ func to_dict() -> Dictionary:
 		"next_route_id": next_route_id,
 		"routes_cycle": routes_cycle,
 		"expeditions": expedition_list,
+		"items": _items_to_dict(),
+		"drip_cycle": drip_cycle,
+		"drip_held": drip_held,
 	}
+
+
+## El inventario en el orden de `Items.all()`, sin los que están a 0. Un id que el catálogo ya no
+## conoce se pierde al guardar, como un nodo de legado borrado: no hay a qué aplicarlo.
+func _items_to_dict() -> Dictionary:
+	var out := {}
+	for def in Items.all():
+		var count := int(items.get(def.id, 0))
+		if count != 0:
+			out[def.id] = count
+	return out
 
 
 static func from_dict(d: Dictionary) -> WorldState:
@@ -486,8 +557,17 @@ static func from_dict(d: Dictionary) -> WorldState:
 	state.rng.seed = state.world_seed
 	state.rng.state = int(d.get("rng_state", 0))
 	for nd in d["nodes"]:
-		var node := SimNode.from_dict(nd)
+		# Un nodo de un save v4 no trae reloj propio: sin boost, es el del mundo.
+		var node := SimNode.from_dict(nd, state.cycle)
 		state.nodes[node.id] = node
+	# Un save v4 no trae objetos: carga sin ninguno y con el goteo contando desde ahora, no desde
+	# el ciclo 0 (si no, la primera carga regalaría de golpe todo el goteo de la partida).
+	var saved_items: Dictionary = d.get("items", {})
+	for def in Items.all():
+		if saved_items.has(def.id):
+			state.items[def.id] = int(saved_items[def.id])
+	state.drip_cycle = float(d.get("drip_cycle", state.cycle))
+	state.drip_held = int(d.get("drip_held", 0))
 	# Un save v2 no trae rutas: carga sin ninguna, que es lo que tenía.
 	for rd in d.get("routes", []):
 		state.routes.append(Route.from_dict(rd))
@@ -500,5 +580,6 @@ static func from_dict(d: Dictionary) -> WorldState:
 	# `route_offset` no se guarda: se deriva aquí, para que el HUD enseñe las tasas con las rutas
 	# desde el primer fotograma y no desde el primer tick.
 	Logistics.compute_offsets(state)
+	state.refresh_boost_end()
 	state.refresh_totals()
 	return state

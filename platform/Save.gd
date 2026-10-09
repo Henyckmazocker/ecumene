@@ -119,11 +119,26 @@ static func migrate(data: Dictionary) -> Dictionary:
 				# v3 → v4: las expediciones son nuevas y `WorldState.from_dict` las toma vacías.
 				# Un save de antes carga sin ninguna en camino, que es lo que tenía.
 				version = 4
+			4:
+				# v4 → v5: objetos y ⚡ boosts son nuevos. `WorldState.from_dict` toma el
+				# inventario vacío, el goteo en el ciclo del save y cada nodo sin boost y con el
+				# reloj del mundo, que es exactamente lo que tenía.
+				version = 5
+			5:
+				_migrate_5_to_6(data)
+				version = 6
 			_:
 				push_warning("Ecumene: sin migración desde el esquema %d." % version)
 				return {}
 	data["schema"] = version
 	return data
+
+
+## v5 → v6: 🎖️ sello por nodo. Todo nodo que ya tenía gobernador queda sellado, para no quitarle a
+## nadie lo que tenía; el resto, sin sellar, y sin 🎖️ Consejo no se delega más.
+static func _migrate_5_to_6(data: Dictionary) -> void:
+	for node_data in data.get("nodes", []):
+		node_data["gov_unlocked"] = (node_data as Dictionary).has("governor")
 
 
 ## v1 → v2: `jobs` dejó de ser un peso relativo y pasó a ser el número de trabajadores

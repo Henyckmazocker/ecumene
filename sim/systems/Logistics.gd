@@ -202,8 +202,9 @@ static func advance_routed(
 		var step := minf(breach.at, dt - t)
 		for id in routed:
 			var node: SimNode = state.nodes[id]
-			node.route_offset = _offset_of(state, id, cut)
-			Integrator.advance(node, params, step, delegated if node.is_delegated() else base)
+			node.route_offset = _dilated(_offset_of(state, id, cut), node.boost_factor)
+			Integrator.advance(node, params, step * node.boost_factor,
+				delegated if node.is_delegated() else base)
 		t += step
 		if breach.node < 0:
 			break
@@ -213,9 +214,11 @@ static func advance_routed(
 	if dt - t > EPS:
 		for id in routed:
 			var node: SimNode = state.nodes[id]
-			node.route_offset = _offset_of(state, id, cut)
-			Integrator.advance(node, params, dt - t, delegated if node.is_delegated() else base)
-	# Las cortadas se quedan cortadas hasta el próximo checkpoint, en los dos extremos.
+			node.route_offset = _dilated(_offset_of(state, id, cut), node.boost_factor)
+			Integrator.advance(node, params, (dt - t) * node.boost_factor,
+				delegated if node.is_delegated() else base)
+	# Las cortadas se quedan cortadas hasta el próximo checkpoint, en los dos extremos. Y
+	# `route_offset` vuelve a ser por ciclo global, sin dilatar: es lo que enseña el HUD.
 	for r in state.routes:
 		if cut.has(r.id):
 			r.flow = 0.0
@@ -245,12 +248,16 @@ static func _first_breach(
 	for id in routed:
 		var node: SimNode = state.nodes[id]
 		var probe := node.duplicate_node()
-		probe.route_offset = _offset_of(state, id, cut)
+		probe.route_offset = _dilated(_offset_of(state, id, cut), node.boost_factor)
 		if probe.route_offset.is_empty():
 			continue  # ya no le queda ninguna ruta abierta: no puede romper nada
 		var pins := Integrator.Pins.new()
-		Integrator.advance(probe, params, remaining, delegated if node.is_delegated() else base,
-			pins)
+		Integrator.advance(probe, params, remaining * node.boost_factor,
+			delegated if node.is_delegated() else base, pins)
+		# ⚡ La sonda de un nodo con boost cuenta en ciclos suyos: los instantes se pasan al reloj
+		# global, que es el que comparten los dos extremos.
+		if node.boost_factor != 1.0:
+			pins = _pins_to_global(pins, node.boost_factor)
 		for r in state.routes:
 			if r.flow <= 0.0 or cut.has(r.id):
 				continue
@@ -310,6 +317,27 @@ static func _offset_of(state: WorldState, node_id: int, cut: Dictionary) -> Pack
 		if payer_of(state, r) == node_id:
 			out[Goods.TRANSPORT] -= r.flow * TRANSPORT_PER_FLOW
 	return out
+
+
+## ⚡ El caudal de un nodo con boost `k`, por ciclo **suyo**: `offset / k`. Avanza `k·t` ciclos
+## suyos, así que mueve `∫(offset/k)·d(k·t) = offset·t`, exactamente lo del otro extremo, y la ruta
+## sigue sin crear ni tirar nada. Sin boost devuelve el mismo array.
+static func _dilated(offset: PackedFloat64Array, k: float) -> PackedFloat64Array:
+	if k == 1.0 or offset.is_empty():
+		return offset
+	var out := offset.duplicate()
+	for i in out.size():
+		out[i] /= k
+	return out
+
+
+## Los instantes de una sonda que ha contado en ciclos de un nodo a ritmo `k`, en ciclos globales.
+static func _pins_to_global(pins: Integrator.Pins, k: float) -> Integrator.Pins:
+	for i in pins.empty_at.size():
+		pins.empty_at[i] /= k
+	for i in pins.full_at.size():
+		pins.full_at[i] /= k
+	return pins
 
 
 static func _add_flow(state: WorldState, r: Route, amount: float) -> void:

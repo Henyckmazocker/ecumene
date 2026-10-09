@@ -100,7 +100,61 @@ func _init() -> void:
 	failures += _same_with_route(4242, 1500)
 	failures += _same_with_regional_governor(4343, 1500)
 
+	# --- ⚡ Un nodo delegado a ×4 (M0 de Objetos de tiempo) ---
+	failures += _boost_is_deterministic()
+
 	TestUtil.finish(self, failures)
+
+
+## **⚡ Un nodo delegado a ×4 sigue siendo determinista.** Dos casos gemelos a `tick(1)`: el pueblo
+## que funda (`_founding_town`), con el boost puesto en el ciclo 10 y renovado en el 300 —su
+## expedición sale acelerada y llega con el boost ya apagado—, y la región que lleva las rutas
+## (`TestUtil.make_regional_engine`), con la raíz a ×4 y sus rutas a `1/4`. El boost y el reloj
+## propio aún no entran en el `state_hash` (M2), así que se comparan aparte, nodo a nodo. Y el
+## gobernador tiene que contar con el reloj del nodo: acaba por delante del mundo.
+func _boost_is_deterministic() -> int:
+	var failures := 0
+	for regional in [false, true]:
+		var label: String = "una región con rutas" if regional else "un pueblo que funda"
+		var a := TestUtil.make_regional_engine(4343) if regional else _founding_town(4242)
+		var b := TestUtil.make_regional_engine(4343) if regional else _founding_town(4242)
+		var forked_at := -1
+		for i in 2800:
+			if i == 10 or i == 300:
+				for e in [a, b]:
+					SimEngine.apply_boost(e.state, e.state.root(), 4.0, 600.0)
+			a.tick(1.0)
+			b.tick(1.0)
+			if a.state.state_hash() != b.state.state_hash() or _clocks(a) != _clocks(b):
+				forked_at = i
+				break
+		var root := a.state.root()
+		# Boost del ciclo 10 al 900 (renovado en el 300): 890 ciclos a ×4, 3·890 de adelanto.
+		var ahead := root.local_cycle - a.state.cycle
+		failures += TestUtil.check(
+			forked_at < 0 and ahead == 2670.0 and root.boost_factor == 1.0
+				and root.governor_last_cycle > a.state.cycle and a.state.nodes.size() > 1,
+			"⚡ ×4 en %s delegado: 2.800 ciclos gemelos, hash y relojes idénticos (%d), %d nodos, la raíz %.0f ciclos por delante" % [
+				label, a.state.state_hash(), a.state.nodes.size(), ahead,
+			],
+			"⚡ ×4 en %s delegado: divergen en el ciclo %d, adelanto %.4f, ×%.0f, gobernador en %.1f con el mundo en %.1f" % [
+				label, forked_at, ahead, root.boost_factor, root.governor_last_cycle, a.state.cycle,
+			]
+		)
+	return failures
+
+
+## Lo del ⚡ que todavía no entra en el `state_hash`: ritmo, fin, reloj propio y reloj del gobernador
+## de cada nodo, y la llegada de cada expedición (que sí entra, pero así se ve en el mismo sitio).
+func _clocks(engine: SimEngine) -> String:
+	var parts := PackedStringArray()
+	for id in engine.state.ordered_ids():
+		var n: SimNode = engine.state.nodes[id]
+		parts.append("%d:%s:%s:%s:%s" % [id, var_to_str(n.boost_factor), var_to_str(n.boost_until),
+			var_to_str(n.local_cycle), var_to_str(n.governor_last_cycle)])
+	for e in engine.state.expeditions:
+		parts.append("e%d:%s" % [e.parent_id, var_to_str(e.arrive_cycle)])
+	return ",".join(parts)
 
 
 ## **Mismo `state_hash` con expediciones.** Dos pueblos gemelos lanzan una expedición a mano y

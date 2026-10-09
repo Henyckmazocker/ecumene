@@ -66,6 +66,14 @@ extends Resource
 ## ⏩ ×precio por cada aceleración ya hecha a la misma expedición: la cuarta ya no compensa.
 @export_range(1.0, 4.0, 0.05) var accelerate_growth: float = 1.5
 
+@export_group("Objetos")
+## Cada cuántos ciclos cae un ⌛ +15 min (`Shop.drip`). Se mide en ciclos del mundo, así que cuenta
+## igual online, offline y dentro de un ⌛.
+@export_range(1.0, 100000.0, 1.0) var drip_interval: float = 3600.0
+## Cuántos ⌛ goteados puede haber a la vez en el inventario (`WorldState.drip_held`). Los
+## comprados no cuentan: comprar no apaga el goteo. Es lo que impide que un ⌛ se autoalimente.
+@export_range(0, 100, 1) var drip_cap: int = 3
+
 @export_group("Progreso offline")
 ## Tope de tiempo offline que se acredita, en segundos reales (24 h).
 @export_range(0.0, 604800.0, 60.0) var offline_cap_seconds: float = 86400.0

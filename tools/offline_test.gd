@@ -42,6 +42,13 @@ func _init() -> void:
 	# recorte deja en el pasado llega en el siguiente tick.
 	failures += _accelerated_jumps_match_steps()
 	failures += _accelerated_to_now_arrives_next_tick()
+	# ⚡ Boost por nodo (M0 de Objetos de tiempo): el nodo dilata su tramo y su ruta va a `1/k`, así
+	# que N×1 == N sigue en pie, la ruta no crea ni tira nada y la expedición llega igual.
+	failures += _boost_n_by_1_equals_jump()
+	failures += _boost_route_conserves()
+	failures += _boost_expedition_n_by_1()
+	# ⌛ Goteo (M4 de Objetos de tiempo): mira `state.cycle`, así que online y offline gotean igual.
+	failures += _drip_online_offline_equal()
 
 	TestUtil.finish(self, failures)
 
@@ -639,5 +646,231 @@ func _accelerated_to_now_arrives_next_tick() -> int:
 		"⏩ acelerar hasta ahora la deja en el ciclo de hoy y llega en el siguiente tick",
 		"⏩ acelerar hasta ahora: acelerada %s, en camino %s, hijo %s" % [
 			ok, waiting, engine.state.nodes.has(child_id),
+		]
+	)
+
+
+## Lo que se pide a un nodo con ⚡ boost, más estricto que `TOLERANCE`: sin boost, los mismos
+## escenarios dan errores de 1e-11.
+const BOOST_TOLERANCE := 1.0e-9
+## El boost acaba a mitad de un checkpoint (1.515 no es múltiplo de 30): el salto parte el tramo.
+const BOOST_CYCLES := 1515.0
+
+
+## **⚡ N×1 == N con un nodo a otro ritmo y su ruta al padre.** El escenario del spike de rutas
+## (`TestUtil.make_routed_engine`), con el boost en el hijo a ×2 y ×4 y luego en el padre, que es
+## quien paga el 🐎. 100 checkpoints ciclo a ciclo frente a uno de un salto cada uno, como
+## `_route_jumps_match_steps`, con el boost expirando a mitad: los stocks, las poblaciones y el
+## reloj propio del nodo (`k·1.515 + el resto`) tienen que salir iguales.
+func _boost_n_by_1_equals_jump() -> int:
+	var failures := 0
+	for k in [2.0, 4.0]:
+		for on_parent in [false, true]:
+			var who: String = "el padre" if on_parent else "el hijo"
+			var engines: Array[SimEngine] = []
+			for _i in 2:
+				var engine := TestUtil.make_routed_engine(4242)
+				var root := engine.state.root()
+				var node: SimNode = root if on_parent else engine.state.nodes[root.children[0]]
+				SimEngine.apply_boost(engine.state, node, k, BOOST_CYCLES)
+				engines.append(engine)
+			var stepwise := engines[0]
+			var jump := engines[1]
+			var interval := stepwise.params.governor_interval
+			for _i in int(interval) * 100:
+				stepwise.tick(1.0)
+			for _i in 100:
+				jump.tick(interval)
+			var measured := _worst_between(stepwise, jump)
+			var boosted_id: int = stepwise.state.root_id if on_parent \
+				else stepwise.state.root().children[0]
+			var a: SimNode = stepwise.state.nodes[boosted_id]
+			var b: SimNode = jump.state.nodes[boosted_id]
+			var clock: float = stepwise.state.cycle + (k - 1.0) * BOOST_CYCLES
+			failures += TestUtil.check(
+				float(measured[0]) <= BOOST_TOLERANCE and bool(measured[2])
+					and a.local_cycle == clock and b.local_cycle == clock
+					and a.boost_factor == 1.0 and b.boost_factor == 1.0,
+				"⚡ ×%d en %s con ruta: 100 checkpoints de un salto == ciclo a ciclo, error máx. %s en %s; reloj %.0f" % [
+					int(k), who, TestUtil.sci(measured[0]), measured[1], a.local_cycle,
+				],
+				"⚡ ×%d en %s: error %s en %s, reloj %.4f / %.4f (se esperaba %.0f), ×%.0f / ×%.0f al final" % [
+					int(k), who, TestUtil.sci(measured[0]), measured[1], a.local_cycle,
+					b.local_cycle, clock, a.boost_factor, b.boost_factor,
+				]
+			)
+	return failures
+
+
+## `[error relativo máximo, dónde, mismos nodos]` entre dos motores, en población y stocks.
+func _worst_between(x: SimEngine, y: SimEngine) -> Array:
+	var worst := 0.0
+	var worst_name := "nada"
+	for id in x.state.ordered_ids():
+		var a: SimNode = x.state.nodes[id]
+		var b: SimNode = y.state.nodes.get(id)
+		if b == null:
+			return [INF, "el nodo %d, que solo existe en uno" % id, false]
+		var err := TestUtil.rel_error(a.pop, b.pop)
+		if err > worst:
+			worst = err
+			worst_name = "población de %d" % id
+		for i in Goods.COUNT:
+			err = TestUtil.rel_error(a.stocks[i], b.stocks[i])
+			if err > worst:
+				worst = err
+				worst_name = "%s de %d" % [Goods.NAMES[i], id]
+	return [worst, worst_name, x.state.nodes.size() == y.state.nodes.size()]
+
+
+## **⚡ Una ruta con un extremo acelerado no crea ni tira nada.** `_route_conserves` con el boost
+## en el destino o en el origen: el hijo integra `k·t` ciclos suyos con el caudal a `1/k`, y lo que
+## entra tiene que ser lo que sale, también en el instante del corte (la sonda de `_first_breach`
+## cuenta en ciclos del nodo y lo pasa al reloj global). Con madera, que nadie produce ni consume.
+func _boost_route_conserves() -> int:
+	var failures := 0
+	for k in [2.0, 4.0]:
+		for on_origin in [false, true]:
+			for case in [[5.0, 0.0, 5.0, "el origen se vacía"], [100.0, -3.0, 3.0, "el destino se llena"]]:
+				for mode in ["paso a paso", "de un salto"]:
+					var engine := _wood_route(case[0], case[1])
+					var state := engine.state
+					var root := state.root()
+					var child: SimNode = state.nodes[root.children[0]]
+					SimEngine.apply_boost(state, root if on_origin else child, k, 600.0)
+					var parent_before := root.stocks[Goods.WOOD]
+					var dest_before := child.stocks[Goods.WOOD]
+					if mode == "paso a paso":
+						for _i in 30:
+							engine.tick(1.0)
+					else:
+						engine.tick(30.0)
+					var left_parent := parent_before - root.stocks[Goods.WOOD]
+					var moved := child.stocks[Goods.WOOD] - dest_before
+					var label := "⚡ ×%d en %s, %s (%s)" % [
+						int(k), "el origen" if on_origin else "el destino", case[3], mode,
+					]
+					failures += TestUtil.check(
+						absf(left_parent - moved) <= BOOST_TOLERANCE
+							and absf(moved - float(case[2])) <= BOOST_TOLERANCE
+							and state.routes[0].flow == 0.0,
+						"%s: sale %.6f de madera del padre y entra %.6f en el hijo" % [
+							label, left_parent, moved,
+						],
+						"%s: la ruta no conserva: sale %.12f, entra %.12f (se esperaba %.1f), caudal %.2f" % [
+							label, left_parent, moved, case[2], state.routes[0].flow,
+						]
+					)
+	return failures
+
+
+## **⚡ La colonia nace en el mismo ciclo de 1 en 1 que de un salto, con el boost expirando a mitad
+## de viaje.** Dos casos sobre el pueblo de `_expedition_jumps_match_steps`: el boost llega con la
+## expedición ya en camino (×2 en el ciclo 100,3: se recalcula lo que le queda) y la expedición
+## sale con el boost puesto (×4 en el ciclo 0,3). En los dos la llegada cerrada tiene que ser la de
+## la cuenta a mano —el tramo acelerado cuenta `k` y el resto 1— y el hijo, el mismo en los tres
+## troceados.
+func _boost_expedition_n_by_1() -> int:
+	var failures := 0
+	for boost_first in [false, true]:
+		var k: float = 4.0 if boost_first else 2.0
+		var at: float = 0.3 if boost_first else 100.3
+		# A ×4, 600 ciclos son justo los 2.400 del viaje: con 450 el boost acaba a mitad.
+		var lasts: float = 450.0 if boost_first else 600.0
+		var engines: Array[SimEngine] = []
+		var child_id := -1
+		var arrive := 0.0
+		var expected := 0.0
+		for _i in 3:
+			var engine := TestUtil.make_engine(4343)
+			var state := engine.state
+			var root := state.root()
+			root.tier = Content.TOWN
+			root.buildings[Content.building_index("hut")] = 20
+			root.buildings[Content.building_index("farm")] = 8
+			root.pop = 60.0
+			for i in Goods.COUNT:
+				root.stocks[i] = 400.0
+			state.refresh_totals()
+			var trip := Promotion.expedition_cycles(state, root, engine.params)
+			child_id = state.next_id
+			if boost_first:
+				engine.tick(at)
+				SimEngine.apply_boost(state, root, k, lasts)
+				Promotion.launch_expedition(state, root, engine.params, null)
+				# `lasts` ciclos a ×k son `lasts·k` del viaje; el resto, a ritmo normal.
+				expected = at + lasts + (trip - lasts * k)
+			else:
+				Promotion.launch_expedition(state, root, engine.params, null)
+				engine.tick(at)
+				SimEngine.apply_boost(state, root, k, lasts)
+				expected = at + lasts + (trip - at - lasts * k)
+			arrive = state.expedition_of(root.id).arrive_cycle
+			engines.append(engine)
+		var case := "×%d %s" % [int(k), "y luego sale" if boost_first else "con la expedición en camino"]
+		failures += TestUtil.check(
+			is_equal_approx(arrive, expected) and arrive > at + lasts,
+			"⚡ %s: llega en el ciclo %.4f, después del fin del boost (%.1f)" % [case, arrive, at + lasts],
+			"⚡ %s: la llegada está en %.6f, no en %.6f" % [case, arrive, expected]
+		)
+		var cycles := int(ceil(arrive - at)) + 50
+		var stepwise := engines[0]
+		var jump := engines[1]
+		var chunked := engines[2]
+		for _i in cycles:
+			stepwise.tick(1.0)
+		jump.tick(float(cycles))
+		for _i in 64:
+			chunked.tick(float(cycles) / 64.0)
+		var a: SimNode = stepwise.state.nodes.get(child_id)
+		for pair in [[jump, "de un salto"], [chunked, "en 64 pasos"]]:
+			var other: SimEngine = pair[0]
+			var b: SimNode = other.state.nodes.get(child_id)
+			if a == null or b == null:
+				failures += TestUtil.check(false, "",
+					"⚡ %s: el hijo no ha llegado (%s 1 en 1, %s %s)" % [case, a != null, b != null, pair[1]])
+				continue
+			var measured := _worst_between(stepwise, other)
+			var root_a := stepwise.state.root()
+			var root_b := other.state.root()
+			failures += TestUtil.check(
+				float(measured[0]) <= BOOST_TOLERANCE and bool(measured[2])
+					and other.state.expeditions.is_empty() and root_b.boost_factor == 1.0
+					and root_a.local_cycle == root_b.local_cycle,
+				"⚡ %s: la colonia nace igual de 1 en 1 que %s, error máx. %s · pob %.4f" % [
+					case, pair[1], TestUtil.sci(measured[0]), b.pop,
+				],
+				"⚡ %s: de 1 en 1 y %s difieren, error %s en %s, reloj %.4f / %.4f" % [
+					case, pair[1], TestUtil.sci(measured[0]), measured[1], root_a.local_cycle,
+					root_b.local_cycle,
+				]
+			)
+	return failures
+
+
+## **⌛ El goteo cuenta igual online que offline.** 10.800 ciclos de 1 en 1 frente a una ausencia
+## que acredita esos mismos 10.800 (`catch_up` con el doble de segundos, por la eficiencia offline):
+## los dos dejan 3 ⌛ goteados y el mismo `drip_cycle`, en el último múltiplo de `drip_interval`.
+func _drip_online_offline_equal() -> int:
+	var online := TestUtil.make_engine(4242)
+	var offline := TestUtil.make_engine(4242)
+	var p := online.params
+	var cycles := 3.0 * p.drip_interval
+	for _i in int(cycles):
+		online.tick(1.0)
+	var credited := offline.catch_up(cycles * p.seconds_per_cycle / p.offline_efficiency)
+	var a := online.state
+	var b := offline.state
+	return TestUtil.check(
+		credited == cycles and a.cycle == cycles and b.cycle == cycles
+			and Shop.count_of(a, "skip_15m") == 3 and Shop.count_of(b, "skip_15m") == 3
+			and a.drip_held == 3 and b.drip_held == 3
+			and a.drip_cycle == cycles and b.drip_cycle == a.drip_cycle,
+		"⌛ goteo: %d ciclos de 1 en 1 y una ausencia equivalente dejan 3 ⌛ y `drip_cycle` %.0f" % [
+			int(cycles), a.drip_cycle,
+		],
+		"⌛ goteo online != offline: acreditados %.1f, ⌛ %d / %d, goteados %d / %d, `drip_cycle` %.1f / %.1f" % [
+			credited, Shop.count_of(a, "skip_15m"), Shop.count_of(b, "skip_15m"), a.drip_held,
+			b.drip_held, a.drip_cycle, b.drip_cycle,
 		]
 	)
